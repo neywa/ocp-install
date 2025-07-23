@@ -11,7 +11,7 @@ How to use it
 - download your pull secret to the ocp-install directory
 - download the openshift installer to the sub-directory
 - the final structure will look like this:
-
+```
 $ tree ocp-install/
 [...]
 ├── 419
@@ -20,10 +20,12 @@ $ tree ocp-install/
 │   └── README.md
 ├── install-config-template.yaml
 └── pull-secret.txt
+```
 
 - run the ocp-install.sh script with the -d flag to specify the base domain
-
+```
 $ ./ocp-install.sh -d <mycluster.mydomain.com>
+```
 
 Next steps:
 - Automate the Gitops operator deployment
