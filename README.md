@@ -11,6 +11,7 @@ How to use it
 - download your pull secret to the ocp-install directory
 - download the openshift installer to the sub-directory
 - the final structure will look like this:
+
 $ tree ocp-install/
 [...]
 ├── 419
@@ -21,10 +22,11 @@ $ tree ocp-install/
 └── pull-secret.txt
 
 - run the ocp-install.sh script with the -d flag to specify the base domain
+
 $ ./ocp-install.sh -d <mycluster.mydomain.com>
 
 Next steps:
 - Automate the Gitops operator deployment
 - Automate the dummy workload deployment
- - Dummy workload is available in my https://github.com/neywa/retro-arcade-hub repo
+    - Dummy workload is available in my https://github.com/neywa/retro-arcade-hub repo
 - Automate deployment of customized observability stack
