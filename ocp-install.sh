@@ -2,7 +2,7 @@
 
 # --- Configuration Variables ---
 INSTALL_DIR_PREFIX="ocp-lab"
-PULL_SECRET_FILE="../pull-secret.txt" # IMPORTANT: Adjust this path!
+PULL_SECRET_FILE="/home/roman/OpenShift/ocp-install/pull-secret.txt" # IMPORTANT: Adjust this path!
 INSTALL_CONFIG_TEMPLATE="../install-config-template.yaml" # Your template file
 
 # --- Variables to be set by flags ---
@@ -89,6 +89,20 @@ echo "This process can take 30-60 minutes or more, depending on your platform an
 # Ensure openshift-install is in your PATH or provide its full path
 ./openshift-install create cluster --dir="$INSTALL_DIR" --log-level=debug
 
+# Ensure your KUBECONFIG is set correctly here to point to the new cluster's kubeconfig
+export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
+
+# Wait for the cluster to be fully up and running before proceeding
+echo "Waiting for cluster API to be ready..."
+oc wait --for=condition=Available apiserver cluster -n openshift-apiserver --timeout=600s
+echo "Cluster API is ready."
+
+echo "Waiting for all cluster operators to be available..."
+# A more robust check might be to wait for specific operators or the "cluster version" to stabilize
+# For a lab, waiting for the cluster-version operator to be "Available" is a good start.
+oc wait --for=condition=Available clusteroperator/authentication --timeout=600s
+oc wait --for=condition=Available clusteroperator/kube-apiserver --timeout=600s
+
 # --- Post-installation Steps (Optional) ---
 # Check exit code of openshift-install
 if [ $? -eq 0 ]; then
@@ -103,4 +117,23 @@ else
 fi
 
 echo "Don't forget to tear down the cluster on Friday using:"
-echo "openshift-install destroy cluster --dir=$INSTALL_DIR"
+echo "openshift-install destroy cluster --dir=$iINSTALL_DIR"
+
+# --- Automate OpenShift GitOps Operator Deployment ---
+echo "Deploying OpenShift GitOps Operator..."
+
+# Apply the OperatorGroup and Subscription
+oc create namespace openshift-gitops
+oc create namespace openshift-gitops-operator
+oc apply -f gitops-operator-install.yaml
+
+# Optional: Wait for the GitOps Operator to be ready
+echo "Waiting for OpenShift GitOps Operator to be ready..."
+# The operator will create a deployment in the openshift-gitops namespace
+oc wait --for=condition=Available deployment/openshift-gitops-operator-controller-manager -n openshift-gitops-operator --timeout=300s
+
+echo "OpenShift GitOps Operator deployed and ready!"
+
+# --- Continue with your Argo CD Application-of-Applications deployment ---
+# Example: oc apply -f my-argocd-app-of-apps.yaml
+
