@@ -92,11 +92,6 @@ echo "This process can take 30-60 minutes or more, depending on your platform an
 # Ensure your KUBECONFIG is set correctly here to point to the new cluster's kubeconfig
 export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
 
-# Wait for the cluster to be fully up and running before proceeding
-echo "Waiting for cluster API to be ready..."
-oc wait --for=condition=Available apiserver cluster -n openshift-apiserver --timeout=600s
-echo "Cluster API is ready."
-
 echo "Waiting for all cluster operators to be available..."
 # A more robust check might be to wait for specific operators or the "cluster version" to stabilize
 # For a lab, waiting for the cluster-version operator to be "Available" is a good start.
@@ -130,6 +125,7 @@ oc apply -f gitops-operator-install.yaml
 # Optional: Wait for the GitOps Operator to be ready
 echo "Waiting for OpenShift GitOps Operator to be ready..."
 # The operator will create a deployment in the openshift-gitops namespace
+sleep 60
 oc wait --for=condition=Available deployment/openshift-gitops-operator-controller-manager -n openshift-gitops-operator --timeout=300s
 
 echo "OpenShift GitOps Operator deployed and ready!"
