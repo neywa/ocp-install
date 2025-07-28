@@ -1,0 +1,23 @@
+# cluster-rbac-argocd.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-application-controller-cluster-admin-role # Choose a descriptive name
+rules:
+- apiGroups: ["*"] # All API groups
+  resources: ["*"] # All resources
+  verbs: ["*"] # All verbs (create, delete, get, list, patch, update, watch)
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-application-controller-cluster-admin-binding
+subjects:
+- kind: ServiceAccount
+  name: openshift-gitops-argocd-application-controller
+  namespace: openshift-gitops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-application-controller-cluster-admin-role # Must match the ClusterRole name
