@@ -130,9 +130,6 @@ oc wait --for=condition=Available deployment/openshift-gitops-operator-controlle
 
 echo "OpenShift GitOps Operator deployed and ready!"
 
-# --- Continue with your Argo CD Application-of-Applications deployment ---
-# Example: oc apply -f my-argocd-app-of-apps.yaml
-
 # Deploy Argo CD ClusterRole and ClusterRoleBinding ---
 echo "Deploying Argo CD ClusterRole and ClusterRoleBinding for controller permissions..."
 oc apply -f cluster-rbac-argocd.yaml
@@ -140,29 +137,13 @@ echo "Argo CD Cluster-wide permissions applied."
 
 
 # Deploy the  Argo CD Applicationis ---
-# If you are using the App-of-Apps pattern with an ApplicationSet (e.g. lab-root-applications from prior discussion)
-# you would apply THAT application here, and it would then auto-discover invaders-application.yaml
-# (assuming invaders-application.yaml is in your Git repo's app-definitions folder)
-# Example: oc apply -f argocd-root-app.yaml
 
 echo "Deploying the Argo CD Applications..."
 oc apply -f apps.yaml
 echo "Argo CD Applications deployed. Argo CD will now synchronize your apps from Git."
 
-# Optional: Add a brief pause to allow Argo CD to start syncing
+# Add a brief pause to allow Argo CD to start syncing
 sleep 10
-
-# Optional: You can try to wait for the Argo CD application to sync and become healthy.
-# This requires the 'argocd' CLI to be installed, or more complex 'oc' parsing.
-# For a lab, observing via the Argo CD UI or 'oc get app -n openshift-gitops' might be enough.
-# echo "Waiting for Invaders application to sync..."
-# argocd app wait invaders-game --health --sync --timeout 600 # Requires argocd CLI
-# echo "Invaders application should now be synced and healthy."
 
 echo "OpenShift Lab Deployment Complete!"
 echo "You can now access your OpenShift cluster and observe Argo CD syncing applications."
-
-# Optional: Display console route or other useful info
-# oc get route console -n openshift-console -o jsonpath='{"OpenShift Console: "}{.spec.host}{"\n"}'
-# oc get route openshift-gitops-server -n openshift-gitops -o jsonpath='{"Argo CD UI: "}{.spec.host}{"\n"}'
-
