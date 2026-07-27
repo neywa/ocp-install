@@ -203,18 +203,20 @@ append_ca_to_kubeconfig() {
     local kubeconfig="$1" ca_file="$2"
     local ctx cluster existing tmp
 
-    ctx="$(oc --kubeconfig="$kubeconfig" config current-context)"
+    # || true so the explicit emptiness checks below own the error path (a failing
+    # oc would otherwise trip set -e before the friendly message).
+    ctx="$(oc --kubeconfig="$kubeconfig" config current-context 2>/dev/null || true)"
     [ -n "$ctx" ] || { echo "Error: could not determine current-context from $kubeconfig" >&2; return 1; }
 
     cluster="$(oc --kubeconfig="$kubeconfig" config view \
-        -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}")"
+        -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}" 2>/dev/null || true)"
     [ -n "$cluster" ] || { echo "Error: could not resolve cluster for context '$ctx'" >&2; return 1; }
 
     echo "Appending CA to kubeconfig cluster entry '$cluster' (context '$ctx')..."
     tmp="$(mktemp)"
     # Decode the existing embedded CA bundle (installer kubeconfigs embed -data).
     existing="$(oc --kubeconfig="$kubeconfig" config view --raw \
-        -o jsonpath="{.clusters[?(@.name==\"$cluster\")].cluster.certificate-authority-data}")"
+        -o jsonpath="{.clusters[?(@.name==\"$cluster\")].cluster.certificate-authority-data}" 2>/dev/null || true)"
     if [ -n "$existing" ]; then
         printf '%s' "$existing" | base64 -d > "$tmp"
     fi
@@ -229,7 +231,10 @@ append_ca_to_kubeconfig() {
 # An empty namespace argument means cluster-scoped (no -n flag).
 wait_for_object() {
     local kind="$1" name="$2" ns="$3" timeout="${4:-300s}"
+    # Expected form is "<n>s"; strip the trailing 's' and fall back to 300 if the
+    # caller ever passes a non-numeric value, so the arithmetic below can't throw.
     local secs="${timeout%s}" waited=0
+    [[ "$secs" =~ ^[0-9]+$ ]] || secs=300
     local nsflag=()
     [ -n "$ns" ] && nsflag=(-n "$ns")
     echo "Waiting for ${kind}/${name}${ns:+ in $ns} to appear (timeout ${timeout})..."
@@ -250,7 +255,7 @@ on_err() {
     local rc=$?
     echo "ERROR: deployment failed (exit $rc)." >&2
     if [ -n "${INSTALL_DIR:-}" ] && [ -f "${INSTALL_DIR}/metadata.json" ]; then
-        echo "A cluster may be partially provisioned in AWS. Tear it down with:" >&2
+        echo "A cluster exists in AWS (dir=${INSTALL_DIR}). If you want to tear it down:" >&2
         echo "  ${OPENSHIFT_INSTALL} destroy cluster --dir=${INSTALL_DIR}" >&2
     fi
     exit "$rc"
@@ -375,7 +380,9 @@ rm -f "$RENDERED.tmp"
 chmod 600 "$RENDERED"
 
 echo "--- Generated install-config.yaml snippet ---"
-grep -E "baseDomain:|name:|region:|expirationDate:|pullSecret:" "$RENDERED" || true
+# Never echo the pullSecret line: it embeds the pull secret. Show it redacted.
+grep -E "baseDomain:|name:|region:|expirationDate:" "$RENDERED" || true
+grep -q "^pullSecret:" "$RENDERED" && echo "pullSecret: <redacted>"
 echo "------------------------------------------"
 
 # --- Dry-run exit -------------------------------------------------------------
@@ -490,10 +497,13 @@ EOF
     oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge --patch='{"spec":{"defaultCertificate":{"name":"ingress-tls"}}}'
 
     echo "Waiting for operators to roll out the new certificates..."
-    wait_co_settled kube-apiserver 2400s   # rolls one revision per control-plane node
-    wait_co_settled ingress        900s
-    wait_co_settled authentication 900s
-    wait_co_settled console        900s
+    # Warn-and-continue: a slow-but-healthy operator should not abort the run or
+    # trigger the destroy hint. Calling in a || context also suspends set -e/the ERR
+    # trap inside wait_co_settled, so its internal oc waits are non-fatal here.
+    wait_co_settled kube-apiserver 2400s || echo "WARN: kube-apiserver slow to settle; continuing." >&2
+    wait_co_settled ingress        900s  || echo "WARN: ingress slow to settle; continuing." >&2
+    wait_co_settled authentication 900s  || echo "WARN: authentication slow to settle; continuing." >&2
+    wait_co_settled console        900s  || echo "WARN: console slow to settle; continuing." >&2
 
     echo "--- Custom Certificate Configuration Complete ---"
     echo "IMPORTANT: import and trust the CA certificate ($CA_CERT_FILE) on your client to avoid browser warnings."

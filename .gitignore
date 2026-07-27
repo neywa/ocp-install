@@ -17,3 +17,9 @@ openshift-install
 
 # Per-run install directories (INSTALL_DIR_PREFIX-YYYYMMDD)
 ocp-lab-*/
+
+# Secret-bearing install artifacts, independent of INSTALL_DIR_PREFIX:
+# the rendered config embeds the pull secret; auth/ holds the kubeconfig.
+install-config.yaml
+install-config.yaml.bak
+**/auth/

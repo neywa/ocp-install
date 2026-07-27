@@ -25,20 +25,71 @@ $ cp lab.env.example lab.env
 $ ./ocp-install.sh -d mycluster.mydomain.com
 ```
 
-Configuration precedence is: built-in defaults < `lab.env` < environment < CLI
-flags. `CLUSTER_NAME` is the single source of truth — it sets `metadata.name` and
-the API/console/ingress hostnames, so the custom certs always match the cluster.
+## Configuration
 
-Useful flags (`--help` lists them all):
+Every setting resolves in this order, lowest to highest precedence:
+
 ```
--d, --base-domain <domain>    required
--c, --cluster-name <name>     default: rbobek
--r, --region <region>         default: eu-central-1
-    --ttl-days <n>            expirationDate tag = today + n (default: 7)
-    --dry-run                 render install-config.yaml and exit (no cluster/AWS)
-    --skip-certs              skip custom certificate configuration
-    --skip-gitops             skip OpenShift GitOps + Argo CD
+built-in defaults  <  lab.env  <  environment  <  CLI flags
 ```
+
+So a value in `lab.env` overrides the built-in default, an exported environment
+variable overrides `lab.env`, and a CLI flag overrides everything. `lab.env` lives
+next to the script and is gitignored.
+
+`CLUSTER_NAME` is the single source of truth — it sets `metadata.name` and the
+API/console/ingress hostnames (`api.<cluster>.<domain>`, `*.apps.<cluster>.<domain>`),
+so the custom certificates always match the hostnames the cluster serves.
+
+### Flags (`--help` prints this too)
+
+```
+Required:
+  -d, --base-domain <domain>        Base domain (e.g. mylab.example.com)
+
+Cluster shape:
+  -c, --cluster-name <name>         Cluster name / metadata.name   (default: rbobek)
+  -r, --region <region>             AWS region                     (default: eu-central-1)
+      --control-plane-replicas <n>  Control-plane node count       (default: 1)
+      --worker-replicas <n>         Worker node count              (default: 1)
+      --control-plane-type <type>   Control-plane instance type    (default: m6i.xlarge)
+      --worker-type <type>          Worker instance type           (default: m6i.xlarge)
+      --ttl-days <n>                Days until expirationDate tag   (default: 7)
+
+Files:
+  -f, --config <file>               install-config template path
+                                    (default: ./install-config-template.yaml)
+
+Behaviour:
+      --dry-run                     Render install-config.yaml and exit (no cluster/AWS)
+      --skip-certs                  Skip custom certificate configuration
+      --skip-gitops                 Skip OpenShift GitOps + Argo CD
+  -h, --help                        Show help and exit
+```
+
+## AWS resource tagging
+
+Every AWS resource the installer creates is tagged via `platform.aws.userTags`:
+
+- `owner`   — from `OWNER` (default: `rbobek`)
+- `purpose` — from `PURPOSE` (default: `lab`)
+- `expirationDate` — today + `--ttl-days` (default 7), e.g. `2026-08-03`
+
+The tag values are quoted strings in the rendered config on purpose: an unquoted
+ISO date would be parsed as a YAML timestamp and break the installer's
+`map[string]string` tag unmarshalling.
+
+## Tearing down
+
+The script prints the exact teardown command when it finishes (and, on failure, if
+a cluster was created). It is:
+
+```
+$ openshift-install destroy cluster --dir=ocp-lab-YYYYMMDD
+```
+
+where `ocp-lab-YYYYMMDD` is the per-run install directory (the `INSTALL_DIR_PREFIX`
+plus the date). Run it from the repo root so the same installer binary is found.
 
 ## Verifying changes
 
