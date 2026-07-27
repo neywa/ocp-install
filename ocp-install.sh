@@ -1,18 +1,22 @@
 #!/bin/bash
 
 # --- Configuration Variables ---
-INSTALL_DIR_PREFIX="ocp-lab"
-PULL_SECRET_FILE="/home/roman/OpenShift/ocp-install/pull-secret.txt" # IMPORTANT: Adjust this path!
-INSTALL_CONFIG_TEMPLATE="../install-config-template.yaml" # Your template file
+# All paths default to their original values but can be overridden via the
+# environment (e.g. by test/smoke.sh) so the script is testable without touching
+# the real fixtures. Defaults are unchanged from a normal run.
+INSTALL_DIR_PREFIX="${INSTALL_DIR_PREFIX:-ocp-lab}"
+PULL_SECRET_FILE="${PULL_SECRET_FILE:-/home/roman/OpenShift/ocp-install/pull-secret.txt}" # IMPORTANT: Adjust this path!
+INSTALL_CONFIG_TEMPLATE="${INSTALL_CONFIG_TEMPLATE:-../install-config-template.yaml}" # Your template file
 
 # --- Custom Certificate Configuration ---
 # IMPORTANT: Adjust these paths to your existing CA files!
-CA_KEY_FILE="/home/roman/OpenShift/certs/ca.key"
-CA_CERT_FILE="/home/roman/OpenShift/certs/ca.crt"
+CA_KEY_FILE="${CA_KEY_FILE:-/home/roman/OpenShift/certs/ca.key}"
+CA_CERT_FILE="${CA_CERT_FILE:-/home/roman/OpenShift/certs/ca.crt}"
 
 # --- Variables to be set by flags ---
 BASE_DOMAIN=""
 CLUSTER_NAME=rbobek
+DRY_RUN="" # When set (via --dry-run), render install-config.yaml and exit.
 # Add more variables here as you introduce new flags (e.g., CLUSTER_NAME="", NODE_COUNT="")
 
 # --- Function to display usage ---
@@ -28,6 +32,21 @@ usage() {
 }
 
 # --- Parse Command Line Arguments ---
+# getopts does not understand long options, so pull --dry-run out of the argument
+# list first and leave the remaining args for getopts to parse as usual.
+REMAINING_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)
+            DRY_RUN=1
+            ;;
+        *)
+            REMAINING_ARGS+=("$arg")
+            ;;
+    esac
+done
+set -- "${REMAINING_ARGS[@]}"
+
 # 'd:' means -d expects an argument
 while getopts "d:" opt; do
     case "${opt}" in
@@ -94,6 +113,15 @@ sed "s#BASE_DOMAIN_PLACEHOLDER#${BASE_DOMAIN}#" > "$INSTALL_DIR/install-config.y
 echo "--- Generated install-config.yaml snippet ---"
 cat "$INSTALL_DIR/install-config.yaml" | grep -E "baseDomain|pullSecret|name:"
 echo "------------------------------------------"
+
+# --- Dry-run exit ---
+# In dry-run mode we stop right after rendering install-config.yaml. Nothing below
+# this point runs, so no command can touch a real cluster or AWS account.
+if [ -n "$DRY_RUN" ]; then
+    echo "Dry-run: rendered install-config.yaml at $INSTALL_DIR/install-config.yaml"
+    echo "Dry-run: skipping cluster installation and all cluster/AWS operations."
+    exit 0
+fi
 
 # --- Start OpenShift Cluster Installation ---
 echo "Starting OpenShift cluster installation in directory: $INSTALL_DIR"
