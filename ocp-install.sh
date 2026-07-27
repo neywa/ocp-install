@@ -14,6 +14,11 @@
 
 set -euo pipefail
 
+# Generated files carry secret material (pull secret, private keys). Create them
+# private from the start rather than relying solely on a later chmod, which
+# leaves a world-readable window (F2).
+umask 077
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Usage -------------------------------------------------------------------
@@ -179,6 +184,15 @@ locate_openshift_install() {
 }
 OPENSHIFT_INSTALL="$(locate_openshift_install)"
 
+# --- xtrace guards around secret handling ------------------------------------
+# `bash -x` would otherwise print the pull secret to stderr the moment it lands
+# in a shell variable (F3). secret_xtrace_off records whether tracing was on and
+# disables it; secret_xtrace_restore turns it back on ONLY if it was on, so a
+# user debugging with -x keeps tracing everywhere else.
+_SECRET_XTRACE=0
+secret_xtrace_off()     { case $- in *x*) _SECRET_XTRACE=1;; *) _SECRET_XTRACE=0;; esac; set +x; }
+secret_xtrace_restore() { [ "$_SECRET_XTRACE" = 1 ] && set -x; return 0; }
+
 # --- Cluster-operator settle helper ------------------------------------------
 # Wait a ClusterOperator through a full rollout cycle after a change: it starts
 # Progressing (which we may miss, so that wait is tolerant), then must return to
@@ -290,9 +304,13 @@ preflight() {
         errors+=("pull secret file not found: $PULL_SECRET_FILE")
     else
         local ps trimmed
+        secret_xtrace_off
         ps="$(tr -d '[:space:]' < "$PULL_SECRET_FILE")"
         trimmed="$ps"
-        if [[ "$trimmed" != \{* || "$trimmed" != *\} || "$trimmed" != *'"auths"'* ]]; then
+        local shaped=1
+        [[ "$trimmed" == \{* && "$trimmed" == *\} && "$trimmed" == *'"auths"'* ]] || shaped=0
+        secret_xtrace_restore
+        if [ "$shaped" -eq 0 ]; then
             errors+=("pull secret does not look like JSON with an \"auths\" object: $PULL_SECRET_FILE")
         elif command -v jq >/dev/null 2>&1; then
             jq -e . "$PULL_SECRET_FILE" >/dev/null 2>&1 || errors+=("pull secret is not valid JSON (jq): $PULL_SECRET_FILE")
@@ -340,6 +358,9 @@ preflight
 INSTALL_DIR="${INSTALL_DIR_PREFIX}-$(date +%Y%m%d)"
 echo "Creating installation directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
+# Holds auth/kubeconfig, kubeadmin-password, the pull-secret-bearing config, and
+# private keys — keep it owner-only, not the default world-traversable 0755 (F2).
+chmod 700 "$INSTALL_DIR"
 
 # --- Render install-config.yaml ----------------------------------------------
 echo "Generating install-config.yaml in $INSTALL_DIR..."
@@ -364,6 +385,7 @@ sed \
 # Step 2: inject the pull secret WITHOUT sed. It is JSON containing / + = and
 # braces, which would be mangled by sed. Rewrite the whole pullSecret line in
 # pure bash; JSON has no single quotes, so single-quoted YAML is safe.
+secret_xtrace_off
 PULL_SECRET_CONTENT="$(tr -d '\n' < "$PULL_SECRET_FILE")"
 {
     while IFS= read -r line || [ -n "$line" ]; do
@@ -375,6 +397,7 @@ PULL_SECRET_CONTENT="$(tr -d '\n' < "$PULL_SECRET_FILE")"
     done < "$RENDERED.tmp"
 } > "$RENDERED"
 rm -f "$RENDERED.tmp"
+secret_xtrace_restore
 
 # The rendered config embeds the pull secret; lock it down in every mode.
 chmod 600 "$RENDERED"
@@ -401,7 +424,10 @@ fi
 trap on_err ERR
 
 # openshift-install consumes install-config.yaml during the run; keep a backup.
-cp "$RENDERED" "$RENDERED.bak"
+# Deliberately redacted: this .bak is the only on-disk record of what was
+# actually deployed (topology, region, tags), but the pull secret is stripped so
+# a durable second copy of the credential never persists (F4).
+sed "s#^pullSecret:.*#pullSecret: '<redacted>'#" "$RENDERED" > "$RENDERED.bak"
 chmod 600 "$RENDERED.bak"
 echo "Backed up rendered install-config to $RENDERED.bak (installer consumes the original)."
 

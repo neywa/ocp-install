@@ -212,6 +212,13 @@ if [ -n "$RENDERED" ]; then
     else
         fail "rendered install-config.yaml mode is $mode, expected 600"
     fi
+    # The install dir holds auth/, keys, and the config; must not be world-traversable.
+    dmode="$(stat -c '%a' "$(dirname "$RENDERED")")"
+    if [ "$dmode" = "700" ]; then
+        pass "install directory is mode 700"
+    else
+        fail "install directory mode is $dmode, expected 700"
+    fi
 fi
 
 # =============================================================================
@@ -289,6 +296,62 @@ if grep -q "Preflight failed with 2 error(s)" <<<"$out4"; then
 else
     echo "----- preflight output -----"; echo "$out4"; echo "----------------------------"
     fail "did not collect both errors in one run"
+fi
+
+# =============================================================================
+echo
+echo "== Test 5: install-config.yaml.bak keeps the deploy record but redacts the secret =="
+# The .bak is written only in the real install path (after --dry-run would exit),
+# right before `create cluster`. Run WITHOUT --dry-run but with all stubs on PATH
+# and --skip-certs/--skip-gitops, so it never touches AWS. Tolerate a non-zero
+# exit: the .bak is produced before any stubbed stage that might fail.
+set +e
+run_ocp run5 -- -d smoke.example.com --skip-certs --skip-gitops >/dev/null 2>&1
+set -e
+BAK="$(find "$SCRATCH/run5" -maxdepth 2 -name install-config.yaml.bak -type f | head -n1)"
+if [ -z "$BAK" ]; then
+    fail "install-config.yaml.bak not found"
+else
+    pass "install-config.yaml.bak exists"
+    if python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$BAK" 2>/dev/null; then
+        pass ".bak parses as YAML"
+    else
+        fail ".bak does not parse as YAML"
+    fi
+    if grep -qF "$auth_a" "$BAK" || grep -qF "$auth_b" "$BAK" || grep -q 'token-aaaa' "$BAK"; then
+        fail ".bak still contains the fixture pull secret"
+    else
+        pass ".bak does not contain the fixture pull secret"
+    fi
+    if grep -q "^pullSecret: '<redacted>'$" "$BAK"; then
+        pass ".bak has pullSecret redacted"
+    else
+        fail ".bak is missing the redacted pullSecret line"
+    fi
+fi
+
+# =============================================================================
+echo
+echo "== Test 6: bash -x does not leak the pull secret to the trace =="
+# Trace the whole run under set -x; both the preflight read and the render
+# injection touch the secret. --dry-run keeps it inert. Grep the trace for the
+# fixture secret; it must not appear.
+mkdir -p "$SCRATCH/run6"
+XTRACE_ERR="$SCRATCH/run6/trace.err"
+(
+    cd "$SCRATCH/run6"
+    env \
+        PATH="$STUB_BIN:$PATH" \
+        PULL_SECRET_FILE="$PULL_SECRET_FILE" \
+        CA_KEY_FILE="$CA_KEY_FILE" \
+        CA_CERT_FILE="$CA_CERT_FILE" \
+        LAB_ENV="$SCRATCH/run6/lab.env" \
+        bash -x "$SCRIPT_UNDER_TEST" -d smoke.example.com --dry-run
+) >/dev/null 2>"$XTRACE_ERR" || true
+if grep -qF "$auth_a" "$XTRACE_ERR" || grep -qF "$auth_b" "$XTRACE_ERR" || grep -q 'token-aaaa' "$XTRACE_ERR"; then
+    fail "pull secret leaked into the bash -x trace"
+else
+    pass "bash -x trace does not contain the pull secret"
 fi
 
 # =============================================================================
