@@ -1,0 +1,34 @@
+title = "ocp-install secret scan"
+
+# Start from the built-in ruleset, then add repo-specific rules below.
+[extend]
+useDefault = true
+
+# OpenShift pull secret: a registry credential value inside the auths JSON.
+# Matches the base64 "auth" VALUE (>=40 chars), so it ignores the smoke-test
+# printf template ("auth":"%s") and the bash glob in ocp-install.sh, while still
+# catching a real pull secret in any file.
+[[rules]]
+id = "openshift-pull-secret"
+description = "OpenShift pull secret registry credential"
+regex = '''"auth"\s*:\s*"[A-Za-z0-9+/]{40,}={0,2}"'''
+keywords = ["auths", "auth"]
+
+# PEM private key material (API/Ingress/CA keys this repo handles).
+[[rules]]
+id = "private-key-pem"
+description = "PEM private key material"
+regex = '''-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----'''
+keywords = ["PRIVATE KEY"]
+
+# Allowlist by VALUE only — never by path. These are the deliberately-fake
+# tokens test/smoke.sh generates; a run of identical chars after "token-" is a
+# fixture shape no real credential has. A real secret in lab.env.example,
+# install-config-template.yaml, or anywhere else is NOT exempted.
+[[allowlists]]
+description = "test/smoke.sh fixture tokens (fake), matched by value not path"
+regexTarget = "line"
+regexes = [
+  '''token-(?:a{4,}|b{4,})''',
+  '''user-[ab]:token-[ab]{4,}''',
+]
