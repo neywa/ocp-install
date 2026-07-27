@@ -1,21 +1,25 @@
 additionalTrustBundlePolicy: Proxyonly
 apiVersion: v1
-baseDomain: BASE_DOMAIN_PLACEHOLDER
+baseDomain: __BASE_DOMAIN__
 compute:
 - architecture: amd64
   hyperthreading: Enabled
   name: worker
-  platform: {}
-  replicas: 1
+  platform:
+    aws:
+      type: __WORKER_TYPE__
+  replicas: __WORKER_REPLICAS__
 controlPlane:
   architecture: amd64
   hyperthreading: Enabled
   name: master
-  platform: {}
-  replicas: 1
+  platform:
+    aws:
+      type: __CONTROL_PLANE_TYPE__
+  replicas: __CONTROL_PLANE_REPLICAS__
 metadata:
   creationTimestamp: null
-  name: ocp-lab
+  name: __CLUSTER_NAME__
 networking:
   clusterNetwork:
   - cidr: 10.128.0.0/14
@@ -27,7 +31,11 @@ networking:
   - 172.30.0.0/16
 platform:
   aws:
-    region: eu-central-1
+    region: __AWS_REGION__
     vpc: {}
+    userTags:
+      owner: "__OWNER__"
+      purpose: "__PURPOSE__"
+      expirationDate: "__EXPIRATION_DATE__"
 publish: External
-pullSecret: 'PULL_SECRET_PLACEHOLDER'
+pullSecret: ""

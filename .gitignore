@@ -1,0 +1,19 @@
+# Local configuration (copy from lab.env.example)
+lab.env
+!lab.env.example
+
+# Secrets and credentials
+pull-secret.txt
+
+# openshift-install binaries (downloaded per y-version)
+openshift-install
+**/openshift-install
+
+# Keys and certificates
+*.key
+*.crt
+*.pem
+*.srl
+
+# Per-run install directories (INSTALL_DIR_PREFIX-YYYYMMDD)
+ocp-lab-*/

@@ -1,279 +1,397 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Deploy an OpenShift lab cluster on AWS (IPI), apply API/Ingress certs signed by
+# a local CA, and bootstrap OpenShift GitOps.
+#
+# CLUSTER_NAME is the single source of truth for the cluster identity: it drives
+# metadata.name in install-config, the cert SANs, and the console/API hostnames.
+#
+# Config resolution order (lowest to highest precedence):
+#   built-in defaults  <  lab.env  <  environment  <  CLI flags
+#
+# See CLAUDE.md for the hard rule: no command here may touch a real cluster or AWS
+# account. Use --dry-run and test/smoke.sh for static verification.
 
-# --- Configuration Variables ---
-# All paths default to their original values but can be overridden via the
-# environment (e.g. by test/smoke.sh) so the script is testable without touching
-# the real fixtures. Defaults are unchanged from a normal run.
-INSTALL_DIR_PREFIX="${INSTALL_DIR_PREFIX:-ocp-lab}"
-PULL_SECRET_FILE="${PULL_SECRET_FILE:-/home/roman/OpenShift/ocp-install/pull-secret.txt}" # IMPORTANT: Adjust this path!
-INSTALL_CONFIG_TEMPLATE="${INSTALL_CONFIG_TEMPLATE:-../install-config-template.yaml}" # Your template file
+set -euo pipefail
 
-# --- Custom Certificate Configuration ---
-# IMPORTANT: Adjust these paths to your existing CA files!
-CA_KEY_FILE="${CA_KEY_FILE:-/home/roman/OpenShift/certs/ca.key}"
-CA_CERT_FILE="${CA_CERT_FILE:-/home/roman/OpenShift/certs/ca.crt}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Variables to be set by flags ---
-BASE_DOMAIN=""
-CLUSTER_NAME=rbobek
-DRY_RUN="" # When set (via --dry-run), render install-config.yaml and exit.
-# Add more variables here as you introduce new flags (e.g., CLUSTER_NAME="", NODE_COUNT="")
-
-# --- Function to display usage ---
+# --- Usage -------------------------------------------------------------------
 usage() {
-    echo "Usage: $0 -d <base_domain> [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  -d <base_domain>    Required: The base domain for your OpenShift cluster (e.g., mylab.example.com)"
-    # Add more options here as you introduce new flags
-    echo ""
-    echo "Example: $0 -d mylab.yourcompany.com"
-    exit 1
+    cat <<EOF
+Usage: $(basename "$0") -d <base_domain> [OPTIONS]
+
+Required:
+  -d, --base-domain <domain>        Base domain for the cluster (e.g. mylab.example.com)
+
+Cluster shape:
+  -c, --cluster-name <name>         Cluster name / metadata.name (default: rbobek)
+  -r, --region <region>             AWS region (default: eu-central-1)
+      --control-plane-replicas <n>  Control-plane node count (default: 1)
+      --worker-replicas <n>         Worker node count (default: 1)
+      --control-plane-type <type>   Control-plane instance type (default: m6i.xlarge)
+      --worker-type <type>          Worker instance type (default: m6i.xlarge)
+      --ttl-days <n>                Days until the expirationDate userTag (default: 7)
+
+Files:
+  -f, --config <file>               install-config template path
+                                    (default: \$SCRIPT_DIR/install-config-template.yaml)
+
+Behaviour:
+      --dry-run                     Render install-config.yaml and exit (no cluster/AWS)
+      --skip-certs                  Skip custom certificate generation/application
+      --skip-gitops                 Skip OpenShift GitOps + Argo CD deployment
+  -h, --help                        Show this help and exit
+
+Configuration is read from \$SCRIPT_DIR/lab.env (copy lab.env.example) and the
+environment. Precedence: defaults < lab.env < environment < CLI flags.
+
+Example: $(basename "$0") -d mylab.example.com -c rbobek --ttl-days 5
+EOF
 }
 
-# --- Parse Command Line Arguments ---
-# getopts does not understand long options, so pull --dry-run out of the argument
-# list first and leave the remaining args for getopts to parse as usual.
-REMAINING_ARGS=()
-for arg in "$@"; do
+# --- Parse CLI flags into CLI_* holders (highest precedence, applied last) ----
+# Holders start unset so ": \${VAR:=...}" defaults and lab.env can fill the gaps;
+# a holder that IS set overrides everything at the end.
+CLI_BASE_DOMAIN=""
+CLI_CLUSTER_NAME=""
+CLI_AWS_REGION=""
+CLI_CONTROL_PLANE_REPLICAS=""
+CLI_WORKER_REPLICAS=""
+CLI_CONTROL_PLANE_TYPE=""
+CLI_WORKER_TYPE=""
+CLI_TTL_DAYS=""
+CLI_INSTALL_CONFIG_TEMPLATE=""
+DRY_RUN=""
+SKIP_CERTS=""
+SKIP_GITOPS=""
+
+# Accept "--flag value", "--flag=value", and short "-f value" forms.
+die() { echo "Error: $*" >&2; exit 1; }
+
+need_val() {
+    # $1 = flag name, $2 = value (may be empty if the user gave none)
+    [ -n "${2:-}" ] || die "flag $1 requires a value"
+}
+
+while [ $# -gt 0 ]; do
+    arg="$1"
+    val=""
     case "$arg" in
-        --dry-run)
-            DRY_RUN=1
-            ;;
-        *)
-            REMAINING_ARGS+=("$arg")
-            ;;
+        --*=*) val="${arg#*=}"; arg="${arg%%=*}" ;;
     esac
-done
-set -- "${REMAINING_ARGS[@]}"
-
-# 'd:' means -d expects an argument
-while getopts "d:" opt; do
-    case "${opt}" in
-        d)
-            BASE_DOMAIN="${OPTARG}"
-            ;;
-        *)
-            # For any other unsupported option
-            usage
-            ;;
+    case "$arg" in
+        -d|--base-domain)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_BASE_DOMAIN="$val" ;;
+        -c|--cluster-name)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_CLUSTER_NAME="$val" ;;
+        -r|--region)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_AWS_REGION="$val" ;;
+        --control-plane-replicas)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_CONTROL_PLANE_REPLICAS="$val" ;;
+        --worker-replicas)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_WORKER_REPLICAS="$val" ;;
+        --control-plane-type)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_CONTROL_PLANE_TYPE="$val" ;;
+        --worker-type)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_WORKER_TYPE="$val" ;;
+        --ttl-days)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_TTL_DAYS="$val" ;;
+        -f|--config)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            CLI_INSTALL_CONFIG_TEMPLATE="$val" ;;
+        --dry-run)     DRY_RUN=1 ;;
+        --skip-certs)  SKIP_CERTS=1 ;;
+        --skip-gitops) SKIP_GITOPS=1 ;;
+        -h|--help)     usage; exit 0 ;;
+        *)             echo "Unknown option: $arg" >&2; usage; exit 1 ;;
     esac
+    shift
 done
-shift $((OPTIND-1)) # Shift positional parameters so $1, $2, etc. refer to non-option arguments
 
-# --- Input Validation ---
-
-# Check if baseDomain was provided via -d flag
-if [ -z "$BASE_DOMAIN" ]; then
-    echo "Error: Base domain not specified."
-    usage
+# --- Config resolution: defaults < lab.env < environment < CLI ----------------
+# LAB_ENV path is env-overridable so the test harness can inject one without
+# writing into the repo.
+LAB_ENV="${LAB_ENV:-$SCRIPT_DIR/lab.env}"
+# shellcheck disable=SC1090
+if [ -f "$LAB_ENV" ]; then
+    echo "Sourcing configuration from $LAB_ENV"
+    source "$LAB_ENV"
 fi
 
-# Check for pull secret file existence
-if [ ! -f "$PULL_SECRET_FILE" ]; then
-    echo "Error: Pull secret file not found at $PULL_SECRET_FILE"
-    exit 1
-fi
+# Built-in defaults fill only what neither the environment nor lab.env set.
+: "${CLUSTER_NAME:=rbobek}"
+: "${AWS_REGION:=eu-central-1}"
+: "${CONTROL_PLANE_REPLICAS:=1}"
+: "${WORKER_REPLICAS:=1}"
+: "${CONTROL_PLANE_TYPE:=m6i.xlarge}"
+: "${WORKER_TYPE:=m6i.xlarge}"
+: "${TTL_DAYS:=7}"
+: "${OWNER:=rbobek}"
+: "${PURPOSE:=lab}"
+: "${OCP_VERSION:=}"
+: "${INSTALL_DIR_PREFIX:=ocp-lab}"
+: "${PULL_SECRET_FILE:=$SCRIPT_DIR/pull-secret.txt}"
+: "${INSTALL_CONFIG_TEMPLATE:=$SCRIPT_DIR/install-config-template.yaml}"
+: "${CA_KEY_FILE:=$SCRIPT_DIR/certs/ca.key}"
+: "${CA_CERT_FILE:=$SCRIPT_DIR/certs/ca.crt}"
+# BASE_DOMAIN has no default; it is required.
+: "${BASE_DOMAIN:=}"
 
-# Check for install config template existence
-if [ ! -f "$INSTALL_CONFIG_TEMPLATE" ]; then
-    echo "Error: Install config template file not found at $INSTALL_CONFIG_TEMPLATE"
-    exit 1
-fi
+# CLI flags win over everything.
+[ -n "$CLI_BASE_DOMAIN" ]             && BASE_DOMAIN="$CLI_BASE_DOMAIN"
+[ -n "$CLI_CLUSTER_NAME" ]            && CLUSTER_NAME="$CLI_CLUSTER_NAME"
+[ -n "$CLI_AWS_REGION" ]              && AWS_REGION="$CLI_AWS_REGION"
+[ -n "$CLI_CONTROL_PLANE_REPLICAS" ] && CONTROL_PLANE_REPLICAS="$CLI_CONTROL_PLANE_REPLICAS"
+[ -n "$CLI_WORKER_REPLICAS" ]        && WORKER_REPLICAS="$CLI_WORKER_REPLICAS"
+[ -n "$CLI_CONTROL_PLANE_TYPE" ]     && CONTROL_PLANE_TYPE="$CLI_CONTROL_PLANE_TYPE"
+[ -n "$CLI_WORKER_TYPE" ]            && WORKER_TYPE="$CLI_WORKER_TYPE"
+[ -n "$CLI_TTL_DAYS" ]               && TTL_DAYS="$CLI_TTL_DAYS"
+[ -n "$CLI_INSTALL_CONFIG_TEMPLATE" ] && INSTALL_CONFIG_TEMPLATE="$CLI_INSTALL_CONFIG_TEMPLATE"
 
-# Check for CA files existence
-if [ ! -f "$CA_KEY_FILE" ] || [ ! -f "$CA_CERT_FILE" ]; then
-    echo "Error: CA key or certificate not found. Check the CA_KEY_FILE and CA_CERT_FILE paths."
-    exit 1
-fi
+# --- Derive everything from the single source of truth ------------------------
+API_HOST="api.${CLUSTER_NAME}.${BASE_DOMAIN}"
+CONSOLE_HOST="console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN}"
+INGRESS_WILDCARD="*.apps.${CLUSTER_NAME}.${BASE_DOMAIN}"
+EXPIRATION_DATE="$(date -u -d "+${TTL_DAYS} days" +%Y-%m-%d 2>/dev/null || true)"
 
+# --- Locate the openshift-install binary --------------------------------------
+# Prefer ./<OCP_VERSION>/openshift-install, then ./openshift-install, then PATH.
+# This replaces the old workflow of copying the script into a version subdir.
+locate_openshift_install() {
+    if [ -n "$OCP_VERSION" ] && [ -x "./${OCP_VERSION}/openshift-install" ]; then
+        echo "./${OCP_VERSION}/openshift-install"
+    elif [ -x "./openshift-install" ]; then
+        echo "./openshift-install"
+    elif command -v openshift-install >/dev/null 2>&1; then
+        command -v openshift-install
+    else
+        echo ""
+    fi
+}
+OPENSHIFT_INSTALL="$(locate_openshift_install)"
 
-# --- Dynamic Directory Naming ---
+# --- Preflight: collect ALL errors, then exit once ----------------------------
+preflight() {
+    local errors=()
+
+    # BASE_DOMAIN is required.
+    [ -n "$BASE_DOMAIN" ] || errors+=("base domain not specified (-d/--base-domain)")
+
+    # TTL_DAYS must be a positive integer (so the derived date is well-formed).
+    if ! [[ "$TTL_DAYS" =~ ^[0-9]+$ ]]; then
+        errors+=("--ttl-days must be a non-negative integer (got '$TTL_DAYS')")
+    elif [ -z "$EXPIRATION_DATE" ]; then
+        errors+=("could not derive expirationDate from --ttl-days=$TTL_DAYS")
+    fi
+
+    # Required tools.
+    local tool
+    for tool in oc openssl sed awk date; do
+        command -v "$tool" >/dev/null 2>&1 || errors+=("required tool not found on PATH: $tool")
+    done
+    [ -n "$OPENSHIFT_INSTALL" ] || errors+=("openshift-install not found (looked in ./${OCP_VERSION:-<OCP_VERSION>}/, ./, and PATH)")
+
+    # Install-config template.
+    [ -f "$INSTALL_CONFIG_TEMPLATE" ] || errors+=("install-config template not found: $INSTALL_CONFIG_TEMPLATE")
+
+    # Pull secret: present and JSON-shaped.
+    if [ ! -f "$PULL_SECRET_FILE" ]; then
+        errors+=("pull secret file not found: $PULL_SECRET_FILE")
+    else
+        local ps trimmed
+        ps="$(tr -d '[:space:]' < "$PULL_SECRET_FILE")"
+        trimmed="$ps"
+        if [[ "$trimmed" != \{* || "$trimmed" != *\} || "$trimmed" != *'"auths"'* ]]; then
+            errors+=("pull secret does not look like JSON with an \"auths\" object: $PULL_SECRET_FILE")
+        elif command -v jq >/dev/null 2>&1; then
+            jq -e . "$PULL_SECRET_FILE" >/dev/null 2>&1 || errors+=("pull secret is not valid JSON (jq): $PULL_SECRET_FILE")
+        fi
+    fi
+
+    # CA files, unless certs are skipped.
+    if [ -z "$SKIP_CERTS" ]; then
+        [ -f "$CA_KEY_FILE" ]  || errors+=("CA key not found: $CA_KEY_FILE (or pass --skip-certs)")
+        [ -f "$CA_CERT_FILE" ] || errors+=("CA cert not found: $CA_CERT_FILE (or pass --skip-certs)")
+    fi
+
+    # AWS checks only when the aws CLI is available (read-only).
+    if command -v aws >/dev/null 2>&1; then
+        if ! aws sts get-caller-identity >/dev/null 2>&1; then
+            errors+=("aws sts get-caller-identity failed (no valid AWS credentials?)")
+        fi
+        if [ -n "$BASE_DOMAIN" ]; then
+            local zones
+            zones="$(aws route53 list-hosted-zones-by-name --dns-name "$BASE_DOMAIN" \
+                        --query "HostedZones[].Name" --output text 2>/dev/null || true)"
+            case " $zones " in
+                *" ${BASE_DOMAIN}. "*|*" ${BASE_DOMAIN} "*) : ;;
+                *) errors+=("no Route53 hosted zone matching base domain '$BASE_DOMAIN'") ;;
+            esac
+        fi
+    else
+        echo "Note: aws CLI not found; skipping AWS credential and Route53 preflight checks."
+    fi
+
+    if [ "${#errors[@]}" -gt 0 ]; then
+        echo "Preflight failed with ${#errors[@]} error(s):" >&2
+        local e
+        for e in "${errors[@]}"; do
+            echo "  - $e" >&2
+        done
+        exit 1
+    fi
+    echo "Preflight checks passed."
+}
+
+preflight
+
+# --- Prepare installation directory ------------------------------------------
 INSTALL_DIR="${INSTALL_DIR_PREFIX}-$(date +%Y%m%d)"
-
-# --- Pre-installation Checks ---
-# You might want to add checks here for openshift-install binary, oc binary, etc.
-
-# --- Prepare Installation Directory ---
 echo "Creating installation directory: $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR" || { echo "Failed to create directory $INSTALL_DIR"; exit 1; }
+mkdir -p "$INSTALL_DIR"
 
-# --- Read Secrets and Data ---
-PULL_SECRET_CONTENT=$(cat "$PULL_SECRET_FILE" | tr -d '\n') # Ensure no newlines in secret
+# --- Render install-config.yaml ----------------------------------------------
+echo "Generating install-config.yaml in $INSTALL_DIR..."
 
-# --- Generate Final install-config.yaml ---
-echo "Generating final install-config.yaml in $INSTALL_DIR..."
+RENDERED="$INSTALL_DIR/install-config.yaml"
 
-# Use sed to replace both placeholders.
-# We use '#' as a delimiter for sed to avoid issues with slashes in the domain or secret.
-sed "s#PULL_SECRET_PLACEHOLDER#${PULL_SECRET_CONTENT}#" "$INSTALL_CONFIG_TEMPLATE" | \
-sed "s#BASE_DOMAIN_PLACEHOLDER#${BASE_DOMAIN}#" > "$INSTALL_DIR/install-config.yaml"
+# Step 1: substitute the safe __TOKEN__ placeholders (all values are
+# alnum/dot/hyphen, safe for sed). The pull secret is handled separately below.
+sed \
+    -e "s#__BASE_DOMAIN__#${BASE_DOMAIN}#g" \
+    -e "s#__CLUSTER_NAME__#${CLUSTER_NAME}#g" \
+    -e "s#__AWS_REGION__#${AWS_REGION}#g" \
+    -e "s#__CONTROL_PLANE_REPLICAS__#${CONTROL_PLANE_REPLICAS}#g" \
+    -e "s#__WORKER_REPLICAS__#${WORKER_REPLICAS}#g" \
+    -e "s#__CONTROL_PLANE_TYPE__#${CONTROL_PLANE_TYPE}#g" \
+    -e "s#__WORKER_TYPE__#${WORKER_TYPE}#g" \
+    -e "s#__OWNER__#${OWNER}#g" \
+    -e "s#__PURPOSE__#${PURPOSE}#g" \
+    -e "s#__EXPIRATION_DATE__#${EXPIRATION_DATE}#g" \
+    "$INSTALL_CONFIG_TEMPLATE" > "$RENDERED.tmp"
 
-# Verify content (optional, for debugging)
+# Step 2: inject the pull secret WITHOUT sed. It is JSON containing / + = and
+# braces, which would be mangled by sed. Rewrite the whole pullSecret line in
+# pure bash; JSON has no single quotes, so single-quoted YAML is safe.
+PULL_SECRET_CONTENT="$(tr -d '\n' < "$PULL_SECRET_FILE")"
+{
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == pullSecret:* ]]; then
+            printf "pullSecret: '%s'\n" "$PULL_SECRET_CONTENT"
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$RENDERED.tmp"
+} > "$RENDERED"
+rm -f "$RENDERED.tmp"
+
 echo "--- Generated install-config.yaml snippet ---"
-cat "$INSTALL_DIR/install-config.yaml" | grep -E "baseDomain|pullSecret|name:"
+grep -E "baseDomain:|name:|region:|expirationDate:|pullSecret:" "$RENDERED" || true
 echo "------------------------------------------"
 
-# --- Dry-run exit ---
-# In dry-run mode we stop right after rendering install-config.yaml. Nothing below
-# this point runs, so no command can touch a real cluster or AWS account.
+# --- Dry-run exit -------------------------------------------------------------
+# Nothing below this point runs in dry-run mode, so no command can touch a real
+# cluster or AWS account.
 if [ -n "$DRY_RUN" ]; then
-    echo "Dry-run: rendered install-config.yaml at $INSTALL_DIR/install-config.yaml"
+    echo "Dry-run: rendered install-config.yaml at $RENDERED"
+    echo "Dry-run: cluster name '$CLUSTER_NAME' -> API host '$API_HOST'"
     echo "Dry-run: skipping cluster installation and all cluster/AWS operations."
     exit 0
 fi
 
-# --- Start OpenShift Cluster Installation ---
+# --- Start OpenShift cluster installation ------------------------------------
 echo "Starting OpenShift cluster installation in directory: $INSTALL_DIR"
-echo "This process can take 30-60 minutes or more, depending on your platform and cluster size."
+echo "This process can take 30-60 minutes or more."
 
-# Ensure openshift-install is in your PATH or provide its full path
-./openshift-install create cluster --dir="$INSTALL_DIR" --log-level=info
-
-# --- Post-installation Steps ---
-if [ $? -ne 0 ]; then
-    echo "OpenShift cluster installation failed. Check logs in $INSTALL_DIR."
-    exit 1
-fi
+"$OPENSHIFT_INSTALL" create cluster --dir="$INSTALL_DIR" --log-level=info
 
 echo "OpenShift cluster installation successful!"
 echo "Kubeconfig is located at: $INSTALL_DIR/auth/kubeconfig"
 export KUBECONFIG="$INSTALL_DIR/auth/kubeconfig"
 
 echo "Waiting for cluster operators to become available..."
-# A more robust check might be to wait for specific operators or the "cluster version" to stabilize
-# For a lab, waiting for the cluster-version operator to be "Available" is a good start.
 oc wait --for=condition=Available clusteroperator/authentication --timeout=600s
 oc wait --for=condition=Available clusteroperator/kube-apiserver --timeout=600s
 
-# --- Custom Certificate Generation and Application ---
-# IMPROVEMENT: Run certificate generation in a subshell to avoid changing the main script's directory
-(
-    echo "--- Starting Custom Certificate Configuration ---"
-    CERT_DIR="$INSTALL_DIR/custom-certs"
-    mkdir -p "$CERT_DIR"
-    cd "$CERT_DIR" || exit 1
+# --- Custom certificate generation and application ---------------------------
+if [ -z "$SKIP_CERTS" ]; then
+    (
+        echo "--- Starting Custom Certificate Configuration ---"
+        CERT_DIR="$INSTALL_DIR/custom-certs"
+        mkdir -p "$CERT_DIR"
+        cd "$CERT_DIR"
 
-    API_HOST="api.rbobek.${BASE_DOMAIN}"
-    CONSOLE_HOST="console-openshift-console.apps.rbobek.${BASE_DOMAIN}"
-    INGRESS_WILDCARD="*.apps.rbobek.${BASE_DOMAIN}"
+        echo "Generating private keys and CSRs for API and Ingress..."
+        openssl genrsa -out api.key 2048
+        openssl req -new -key api.key -out api.csr -subj "/CN=${API_HOST}" -reqexts SAN \
+            -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${API_HOST}")
 
-    echo "Generating private keys and CSRs for API and Ingress..."
+        openssl genrsa -out ingress.key 2048
+        openssl req -new -key ingress.key -out ingress.csr -subj "/CN=${INGRESS_WILDCARD}" -reqexts SAN \
+            -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
 
-    # Generate API Server Key and CSR
-    openssl genrsa -out api.key 2048
-    openssl req -new -key api.key -out api.csr -subj "/CN=${API_HOST}" -reqexts SAN -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${API_HOST}")
+        echo "Signing certificates with the provided CA..."
+        openssl x509 -req -in api.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial \
+            -out api.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${API_HOST}")
+        openssl x509 -req -in ingress.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial \
+            -out ingress.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
 
-    # Generate Ingress Key and CSR
-    openssl genrsa -out ingress.key 2048
-    openssl req -new -key ingress.key -out ingress.csr -subj "/CN=${INGRESS_WILDCARD}" -reqexts SAN -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
+        echo "Applying custom certificates to the cluster..."
+        cd ../..
+        oc create configmap custom-ca --from-file=ca-bundle.crt="$CA_CERT_FILE" -n openshift-config || true
+        oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"custom-ca"}}}'
 
-    echo "Signing certificates with the provided CA..."
+        oc create secret tls api-tls --cert="$INSTALL_DIR/custom-certs/api.crt" --key="$INSTALL_DIR/custom-certs/api.key" -n openshift-config || true
+        oc create secret tls ingress-tls --cert="$INSTALL_DIR/custom-certs/ingress.crt" --key="$INSTALL_DIR/custom-certs/ingress.key" -n openshift-ingress || true
 
-    # Sign the API server certificate
-    openssl x509 -req -in api.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial -out api.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${API_HOST}")
+        echo "Patching API server to use the new certificate..."
+        oc patch apiserver/cluster --type=merge --patch='{"spec":{"servingCerts":{"namedCertificates":[{"names":["'"$API_HOST"'"],"servingCertificate":{"name":"api-tls"}}]}}}'
 
-    # Sign the Ingress certificate
-    openssl x509 -req -in ingress.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial -out ingress.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
+        echo "Patching Ingress Controller to use the new certificate..."
+        oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge --patch='{"spec":{"defaultCertificate":{"name":"ingress-tls"}}}'
 
-    echo "Applying custom certificates to the cluster..."
+        echo "--- Custom Certificate Configuration Complete ---"
+        echo "IMPORTANT: import and trust the CA certificate ($CA_CERT_FILE) on your client to avoid browser warnings."
+    )
 
-    # Create the custom CA config map and apply it to the proxy
-    cd ../..
-    oc create configmap custom-ca --from-file=ca-bundle.crt=$CA_CERT_FILE -n openshift-config
-    oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"custom-ca"}}}'
+    echo "Updating kubeconfig to trust the new custom CA..."
+    oc --kubeconfig="$KUBECONFIG" config set-cluster "${CLUSTER_NAME}" --certificate-authority="${CA_CERT_FILE}" --embed-certs=true
+    echo "Kubeconfig updated successfully."
+else
+    echo "Skipping custom certificate configuration (--skip-certs)."
+fi
 
-    # Create secrets in the appropriate namespaces
-    oc create secret tls api-tls --cert=$INSTALL_DIR/custom-certs/api.crt --key=$INSTALL_DIR/custom-certs/api.key -n openshift-config
-    oc create secret tls ingress-tls --cert=$INSTALL_DIR/custom-certs/ingress.crt --key=$INSTALL_DIR/custom-certs/ingress.key -n openshift-ingress
+# --- OpenShift GitOps + Argo CD ----------------------------------------------
+if [ -z "$SKIP_GITOPS" ]; then
+    echo "Deploying OpenShift GitOps Operator..."
+    oc create namespace openshift-gitops || true
+    oc create namespace openshift-gitops-operator || true
+    oc apply -f "$SCRIPT_DIR/gitops-operator-install.yaml"
 
-    # Patch the cluster resources to use the new secrets
-    echo "Patching API server to use the new certificate..."
-    oc patch apiserver/cluster --type=merge --patch='{"spec":{"servingCerts":{"namedCertificates":[{"names":["'"$API_HOST"'"],"servingCertificate":{"name":"api-tls"}}]}}}'
+    echo "Waiting for OpenShift GitOps Operator to be ready..."
+    oc wait --for=condition=Available deployment/openshift-gitops-operator-controller-manager \
+        -n openshift-gitops-operator --timeout=300s || true
+    echo "OpenShift GitOps Operator deployed."
 
-    echo "Patching Ingress Controller to use the new certificate..."
-    oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge --patch='{"spec":{"defaultCertificate":{"name":"ingress-tls"}}}'
+    echo "Deploying Argo CD ClusterRole and ClusterRoleBinding..."
+    oc apply -f "$SCRIPT_DIR/cluster-rbac-argocd.yaml"
+    echo "Argo CD cluster-wide permissions applied."
 
-    echo "Monitoring rollout of new certificates..."
-    echo "Watching API server pods (this may take several minutes)..."
-    oc get pods -n openshift-kube-apiserver -w
-
-    echo "Watching Ingress controller pods..."
-    oc get pods -n openshift-ingress -w
-
-    echo "--- Custom Certificate Configuration Complete ---"
-    echo "IMPORTANT: To avoid browser warnings, you must import and trust the CA certificate ($CA_CERT_FILE) on your client machine."
-
-    # A 30-second countdown function to show the user a timer.
-    countdown() {
-      local seconds=30
-      echo "Let's wait till the needed bits of the cluster are up and running..."
-      for ((i = seconds; i >= 0; i--)); do
-        # Use printf with \r to overwrite the same line
-        printf "\r Time remaining: %2d seconds" "$i"
-        sleep 1
-      done
-      # Print a newline at the end to move to the next line in the terminal
-      printf "\n Countdown complete!\n"
-    }
-
-    countdown 
-)
-
-echo "Updating kubeconfig to trust the new custom CA..."
-
-oc --kubeconfig="$KUBECONFIG" config set-cluster "${CLUSTER_NAME}" --certificate-authority="${CA_CERT_FILE}" --embed-certs=true
-
-echo "Kubeconfig updated successfully."
-
-# --- Automate OpenShift GitOps Operator Deployment ---
-echo "Deploying OpenShift GitOps Operator..."
-
-# Apply the OperatorGroup and Subscription
-oc create namespace openshift-gitops
-oc create namespace openshift-gitops-operator
-oc apply -f gitops-operator-install.yaml
-
-# Optional: Wait for the GitOps Operator to be ready
-echo "Waiting for OpenShift GitOps Operator to be ready..."
-# The operator will create a deployment in the openshift-gitops namespace
-sleep 60
-oc wait --for=condition=Available deployment/openshift-gitops-operator-controller-manager -n openshift-gitops-operator --timeout=300s
-
-echo "OpenShift GitOps Operator deployed and ready!"
-
-# --- Continue with your Argo CD Application-of-Applications deployment ---
-# Example: oc apply -f my-argocd-app-of-apps.yaml
-
-# Deploy Argo CD ClusterRole and ClusterRoleBinding ---
-echo "Deploying Argo CD ClusterRole and ClusterRoleBinding for controller permissions..."
-oc apply -f cluster-rbac-argocd.yaml
-echo "Argo CD Cluster-wide permissions applied."
-
-
-# Deploy the Invaders Argo CD Application ---
-# If you are using the App-of-Apps pattern with an ApplicationSet (e.g. lab-root-applications from prior discussion)
-# you would apply THAT application here, and it would then auto-discover invaders-application.yaml
-# (assuming invaders-application.yaml is in your Git repo's app-definitions folder)
-# Example: oc apply -f argocd-root-app.yaml
-
-echo "Deploying the Invaders Argo CD Application..."
-oc apply -f invaders-application.yaml
-echo "Invaders Argo CD Application deployed. Argo CD will now synchronize your Invaders game from Git."
-
-# Optional: Add a brief pause to allow Argo CD to start syncing
-sleep 10
-
-# Optional: You can try to wait for the Argo CD application to sync and become healthy.
-# This requires the 'argocd' CLI to be installed, or more complex 'oc' parsing.
-# For a lab, observing via the Argo CD UI or 'oc get app -n openshift-gitops' might be enough.
-# echo "Waiting for Invaders application to sync..."
-# argocd app wait invaders-game --health --sync --timeout 600 # Requires argocd CLI
-# echo "Invaders application should now be synced and healthy."
+    echo "Deploying the Invaders Argo CD Application..."
+    oc apply -f "$SCRIPT_DIR/invaders-application.yaml"
+    echo "Invaders Argo CD Application deployed."
+else
+    echo "Skipping OpenShift GitOps deployment (--skip-gitops)."
+fi
 
 echo "OpenShift Lab Deployment Complete!"
-echo "You can now access your OpenShift cluster and observe Argo CD syncing applications."
-
-echo "Don't forget to tear down the cluster on Friday using:"
-echo "openshift-install destroy cluster --dir=$INSTALL_DIR"
-
+echo "Tear down the cluster with: $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"
