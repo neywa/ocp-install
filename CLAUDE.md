@@ -20,7 +20,8 @@ The AWS environment must be prepared beforehand (see the README).
    required tools, pull secret present + JSON-shaped, template present, CA files
    present (unless `--skip-certs`), and — if the `aws` CLI exists — `aws sts
    get-caller-identity` plus a Route53 hosted-zone check for the base domain.
-4. **Create dated install dir** — `${INSTALL_DIR_PREFIX}-YYYYMMDD`.
+4. **Create per-run install dir** — `${WORKDIR_ROOT}/${CLUSTER_NAME}-YYYYMMDD-HHMMSS`
+   (default `WORKDIR_ROOT=$SCRIPT_DIR/clusters`; the whole `clusters/` tree is gitignored).
 5. **Render `install-config.yaml`** — `sed` substitutes the safe `__TOKEN__`
    placeholders; the pull secret is injected by a **pure-bash line rewrite** (never
    `sed`, since the JSON contains `/ + = { }`). **`--dry-run` exits here** — nothing
@@ -67,7 +68,7 @@ Resolution order (lowest → highest): **built-in defaults < `lab.env` <
 environment < CLI flags**. `lab.env` (gitignored; copy from `lab.env.example`) uses
 the `: "${VAR:=value}"` form so it never clobbers a value already in the
 environment. Overridable vars: `CLUSTER_NAME`, `AWS_REGION`, replicas, instance
-types, `OWNER`, `PURPOSE`, `TTL_DAYS`, `OCP_VERSION`, `INSTALL_DIR_PREFIX`,
+types, `OWNER`, `PURPOSE`, `TTL_DAYS`, `OCP_VERSION`, `WORKDIR_ROOT`,
 `PULL_SECRET_FILE`, `INSTALL_CONFIG_TEMPLATE`, `CA_KEY_FILE`, `CA_CERT_FILE`. Paths
 default repo-relative — **no personal absolute paths**. `LAB_ENV` (env only) points
 at the config file; the smoke test uses it to inject a scratch `lab.env`.

@@ -143,7 +143,7 @@ fi
 : "${OWNER:=rbobek}"
 : "${PURPOSE:=lab}"
 : "${OCP_VERSION:=}"
-: "${INSTALL_DIR_PREFIX:=ocp-lab}"
+: "${WORKDIR_ROOT:=$SCRIPT_DIR/clusters}"   # fixed parent for all per-run install dirs
 : "${PULL_SECRET_FILE:=$SCRIPT_DIR/pull-secret.txt}"
 : "${INSTALL_CONFIG_TEMPLATE:=$SCRIPT_DIR/install-config-template.yaml}"
 : "${CA_KEY_FILE:=$SCRIPT_DIR/certs/ca.key}"
@@ -355,7 +355,10 @@ preflight() {
 preflight
 
 # --- Prepare installation directory ------------------------------------------
-INSTALL_DIR="${INSTALL_DIR_PREFIX}-$(date +%Y%m%d)"
+# Every per-run dir lives under the fixed WORKDIR_ROOT parent so .gitignore can
+# target the parent, not a leaf naming convention. Timestamped to the second so
+# same-day reruns never collide.
+INSTALL_DIR="${WORKDIR_ROOT}/${CLUSTER_NAME}-$(date +%Y%m%d-%H%M%S)"
 echo "Creating installation directory: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 # Holds auth/kubeconfig, kubeadmin-password, the pull-secret-bearing config, and

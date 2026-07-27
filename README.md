@@ -85,11 +85,12 @@ The script prints the exact teardown command when it finishes (and, on failure, 
 a cluster was created). It is:
 
 ```
-$ openshift-install destroy cluster --dir=ocp-lab-YYYYMMDD
+$ openshift-install destroy cluster --dir=clusters/<cluster-name>-YYYYMMDD-HHMMSS
 ```
 
-where `ocp-lab-YYYYMMDD` is the per-run install directory (the `INSTALL_DIR_PREFIX`
-plus the date). Run it from the repo root so the same installer binary is found.
+where `clusters/<cluster-name>-YYYYMMDD-HHMMSS` is the per-run install directory.
+Every run lives under `WORKDIR_ROOT` (default `./clusters`, the whole tree is
+gitignored). Run the command from the repo root so the same installer binary is found.
 
 ## Verifying changes
 

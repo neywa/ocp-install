@@ -2,6 +2,9 @@
 lab.env
 !lab.env.example
 
+# Claude Code session state — never commit
+.claude/
+
 # Secrets and credentials
 pull-secret.txt
 
@@ -15,11 +18,12 @@ openshift-install
 *.pem
 *.srl
 
-# Per-run install directories (INSTALL_DIR_PREFIX-YYYYMMDD)
-ocp-lab-*/
+# All per-run install directories live here (WORKDIR_ROOT default)
+/clusters/
 
-# Secret-bearing install artifacts, independent of INSTALL_DIR_PREFIX:
-# the rendered config embeds the pull secret; auth/ holds the kubeconfig.
+# Basename backstops — secret-bearing artifacts regardless of WORKDIR_ROOT
 install-config.yaml
 install-config.yaml.bak
 **/auth/
+**/kubeadmin-password
+**/metadata.json

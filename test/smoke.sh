@@ -127,6 +127,7 @@ run_ocp() {
             CA_KEY_FILE="$CA_KEY_FILE" \
             CA_CERT_FILE="$CA_CERT_FILE" \
             LAB_ENV="$rundir/lab.env" \
+            WORKDIR_ROOT="$rundir/clusters" \
             "${envs[@]}" \
             bash "$SCRIPT_UNDER_TEST" "$@"
     )
@@ -137,7 +138,7 @@ echo
 echo "== Test 1: render + core assertions (default cluster name) =="
 # Rendered install-config lands under the run dir; find it afterwards.
 run_ocp run1 -- -d smoke.example.com --dry-run
-RENDERED="$(find "$SCRATCH/run1" -maxdepth 2 -name install-config.yaml -type f | head -n1)"
+RENDERED="$(find "$SCRATCH/run1" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
 if [ -z "$RENDERED" ]; then
     fail "rendered install-config.yaml not found"
 elif RENDERED="$RENDERED" PULL_SECRET_FILE="$PULL_SECRET_FILE" python3 - <<'PY'
@@ -229,7 +230,7 @@ cat > "$SCRATCH/run2/lab.env" <<'EOF'
 : "${CLUSTER_NAME:=fromfile}"
 EOF
 run_ocp run2 -- -d smoke.example.com --cluster-name fromflag --dry-run >/dev/null
-R2="$(find "$SCRATCH/run2" -maxdepth 2 -name install-config.yaml -type f | head -n1)"
+R2="$(find "$SCRATCH/run2" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
 name2="$(yaml_get "$R2" metadata.name)"
 if [ "$name2" = "fromflag" ]; then
     pass "flag --cluster-name beat lab.env (metadata.name=$name2)"
@@ -241,7 +242,7 @@ fi
 mkdir -p "$SCRATCH/run2b"
 cp "$SCRATCH/run2/lab.env" "$SCRATCH/run2b/lab.env"
 run_ocp run2b -- -d smoke.example.com --dry-run >/dev/null
-R2B="$(find "$SCRATCH/run2b" -maxdepth 2 -name install-config.yaml -type f | head -n1)"
+R2B="$(find "$SCRATCH/run2b" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
 name2b="$(yaml_get "$R2B" metadata.name)"
 if [ "$name2b" = "fromfile" ]; then
     pass "lab.env beat the built-in default (metadata.name=$name2b)"
@@ -257,7 +258,7 @@ cat > "$SCRATCH/run3/lab.env" <<'EOF'
 : "${AWS_REGION:=region-from-file}"
 EOF
 run_ocp run3 AWS_REGION=region-from-env -- -d smoke.example.com --dry-run >/dev/null
-R3="$(find "$SCRATCH/run3" -maxdepth 2 -name install-config.yaml -type f | head -n1)"
+R3="$(find "$SCRATCH/run3" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
 region3="$(yaml_get "$R3" platform.aws.region)"
 if [ "$region3" = "region-from-env" ]; then
     pass "environment beat lab.env (region=$region3)"
@@ -308,7 +309,7 @@ echo "== Test 5: install-config.yaml.bak keeps the deploy record but redacts the
 set +e
 run_ocp run5 -- -d smoke.example.com --skip-certs --skip-gitops >/dev/null 2>&1
 set -e
-BAK="$(find "$SCRATCH/run5" -maxdepth 2 -name install-config.yaml.bak -type f | head -n1)"
+BAK="$(find "$SCRATCH/run5" -maxdepth 3 -name install-config.yaml.bak -type f | head -n1)"
 if [ -z "$BAK" ]; then
     fail "install-config.yaml.bak not found"
 else
@@ -346,12 +347,44 @@ XTRACE_ERR="$SCRATCH/run6/trace.err"
         CA_KEY_FILE="$CA_KEY_FILE" \
         CA_CERT_FILE="$CA_CERT_FILE" \
         LAB_ENV="$SCRATCH/run6/lab.env" \
+        WORKDIR_ROOT="$SCRATCH/run6/clusters" \
         bash -x "$SCRIPT_UNDER_TEST" -d smoke.example.com --dry-run
 ) >/dev/null 2>"$XTRACE_ERR" || true
 if grep -qF "$auth_a" "$XTRACE_ERR" || grep -qF "$auth_b" "$XTRACE_ERR" || grep -q 'token-aaaa' "$XTRACE_ERR"; then
     fail "pull secret leaked into the bash -x trace"
 else
     pass "bash -x trace does not contain the pull secret"
+fi
+
+# =============================================================================
+echo
+echo "== Test 7: .gitignore covers every runtime artifact under the new layout =="
+# Prove (don't eyeball) that the repo .gitignore ignores each secret-bearing
+# artifact path. Paths are hypothetical; git check-ignore evaluates rules, not
+# the filesystem. Run against the real repo so the actual .gitignore is tested.
+RUN_DIR_EX="clusters/rbobek-20260727-153012"
+IGNORED_PATHS=(
+    "$RUN_DIR_EX/install-config.yaml"
+    "$RUN_DIR_EX/install-config.yaml.bak"
+    "$RUN_DIR_EX/auth/kubeconfig"
+    "$RUN_DIR_EX/auth/kubeadmin-password"
+    "$RUN_DIR_EX/metadata.json"
+    "$RUN_DIR_EX/custom-certs/api.key"
+    "$RUN_DIR_EX/custom-certs/api.crt"
+    "$RUN_DIR_EX/custom-certs/ca.srl"
+)
+for p in "${IGNORED_PATHS[@]}"; do
+    if git -C "$REPO_DIR" check-ignore -q "$p"; then
+        pass "ignored: $p"
+    else
+        fail "NOT ignored: $p"
+    fi
+done
+# The example config must stay trackable (the !lab.env.example negation).
+if git -C "$REPO_DIR" check-ignore -q lab.env.example; then
+    fail "lab.env.example is ignored (negation broken)"
+else
+    pass "lab.env.example is trackable (not ignored)"
 fi
 
 # =============================================================================
