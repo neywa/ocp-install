@@ -29,10 +29,15 @@ The AWS environment must be prepared beforehand (see the README).
    the located binary (see below).
 7. **Wait for core operators** — `oc wait` on authentication + kube-apiserver.
 8. **Custom certificates** (skipped by `--skip-certs`) — generate API + Ingress
-   keys/CSRs for the derived hostnames, sign with the local CA, apply as TLS
-   secrets, install a trusted-CA configmap + patch the cluster proxy, patch
-   `apiserver/cluster` and `ingresscontroller/default`, then embed the CA in the
-   kubeconfig.
+   keys/CSRs for the derived hostnames (openssl configs written to real files;
+   signed certs carry `basicConstraints/keyUsage/extendedKeyUsage=serverAuth`;
+   keys `chmod 600`), sign with the local CA, install a trusted-CA configmap +
+   patch the cluster proxy, create the TLS secrets, then — **ordering is critical**
+   — `append_ca_to_kubeconfig` updates the local kubeconfig (appending the CA to
+   the existing bundle, patching the entry derived from the current context)
+   **before** patching `apiserver/cluster`, so the client keeps trusting the API
+   once it serves the new cert. Patch `apiserver/cluster` + `ingresscontroller/default`,
+   then `wait_co_settled` for kube-apiserver (2400s), ingress, authentication, console.
 9. **OpenShift GitOps + Argo CD** (skipped by `--skip-gitops`) — create namespaces,
    apply `gitops-operator-install.yaml`, `cluster-rbac-argocd.yaml`, and
    `invaders-application.yaml`.

@@ -179,6 +179,51 @@ locate_openshift_install() {
 }
 OPENSHIFT_INSTALL="$(locate_openshift_install)"
 
+# --- Cluster-operator settle helper ------------------------------------------
+# Wait a ClusterOperator through a full rollout cycle after a change: it starts
+# Progressing (which we may miss, so that wait is tolerant), then must return to
+# Progressing=False, Available=True, Degraded=False.
+wait_co_settled() {
+    local co="$1" timeout="${2:-900s}"
+    echo "Waiting for clusteroperator/${co} to settle (timeout ${timeout})..."
+    # It may not have observed the change yet; tolerate this initial wait timing out.
+    oc wait --for=condition=Progressing=True "clusteroperator/${co}" --timeout=120s 2>/dev/null || true
+    oc wait --for=condition=Progressing=False "clusteroperator/${co}" --timeout="$timeout"
+    oc wait --for=condition=Available=True   "clusteroperator/${co}" --timeout="$timeout"
+    oc wait --for=condition=Degraded=False   "clusteroperator/${co}" --timeout="$timeout"
+    echo "clusteroperator/${co} settled."
+}
+
+# --- Append a CA to the kubeconfig's existing trust bundle --------------------
+# Patches the EXISTING cluster entry (derived from the current context, not
+# assumed from CLUSTER_NAME) and APPENDS the CA to the existing
+# certificate-authority-data rather than replacing it. Fails loudly on empty
+# lookups so a bad kubeconfig aborts the run under set -e.
+append_ca_to_kubeconfig() {
+    local kubeconfig="$1" ca_file="$2"
+    local ctx cluster existing tmp
+
+    ctx="$(oc --kubeconfig="$kubeconfig" config current-context)"
+    [ -n "$ctx" ] || { echo "Error: could not determine current-context from $kubeconfig" >&2; return 1; }
+
+    cluster="$(oc --kubeconfig="$kubeconfig" config view \
+        -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}")"
+    [ -n "$cluster" ] || { echo "Error: could not resolve cluster for context '$ctx'" >&2; return 1; }
+
+    echo "Appending CA to kubeconfig cluster entry '$cluster' (context '$ctx')..."
+    tmp="$(mktemp)"
+    # Decode the existing embedded CA bundle (installer kubeconfigs embed -data).
+    existing="$(oc --kubeconfig="$kubeconfig" config view --raw \
+        -o jsonpath="{.clusters[?(@.name==\"$cluster\")].cluster.certificate-authority-data}")"
+    if [ -n "$existing" ]; then
+        printf '%s' "$existing" | base64 -d > "$tmp"
+    fi
+    cat "$ca_file" >> "$tmp"
+    oc --kubeconfig="$kubeconfig" config set-cluster "$cluster" \
+        --certificate-authority="$tmp" --embed-certs=true
+    rm -f "$tmp"
+}
+
 # --- Preflight: collect ALL errors, then exit once ----------------------------
 preflight() {
     local errors=()
@@ -324,48 +369,85 @@ oc wait --for=condition=Available clusteroperator/kube-apiserver --timeout=600s
 
 # --- Custom certificate generation and application ---------------------------
 if [ -z "$SKIP_CERTS" ]; then
-    (
-        echo "--- Starting Custom Certificate Configuration ---"
-        CERT_DIR="$INSTALL_DIR/custom-certs"
-        mkdir -p "$CERT_DIR"
-        cd "$CERT_DIR"
+    echo "--- Starting Custom Certificate Configuration ---"
+    # Absolute cert dir so every openssl/oc arg is unambiguous (no cd/subshell).
+    CERT_DIR="$(cd "$INSTALL_DIR" && pwd)/custom-certs"
+    mkdir -p "$CERT_DIR"
 
-        echo "Generating private keys and CSRs for API and Ingress..."
-        openssl genrsa -out api.key 2048
-        openssl req -new -key api.key -out api.csr -subj "/CN=${API_HOST}" -reqexts SAN \
-            -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${API_HOST}")
+    # openssl config files written to disk (no process substitution).
+    cat > "$CERT_DIR/api-req.cnf" <<EOF
+[req]
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+[SAN]
+subjectAltName = DNS:${API_HOST}
+EOF
+    cat > "$CERT_DIR/ingress-req.cnf" <<EOF
+[req]
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+[SAN]
+subjectAltName = DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}
+EOF
+    cat > "$CERT_DIR/api-ext.cnf" <<EOF
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:${API_HOST}
+EOF
+    cat > "$CERT_DIR/ingress-ext.cnf" <<EOF
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}
+EOF
 
-        openssl genrsa -out ingress.key 2048
-        openssl req -new -key ingress.key -out ingress.csr -subj "/CN=${INGRESS_WILDCARD}" -reqexts SAN \
-            -config <(printf "[req]\ndistinguished_name=req_distinguished_name\n[req_distinguished_name]\n[SAN]\nsubjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
+    echo "Generating private keys and CSRs for API and Ingress..."
+    openssl genrsa -out "$CERT_DIR/api.key" 2048
+    openssl genrsa -out "$CERT_DIR/ingress.key" 2048
+    chmod 600 "$CERT_DIR/api.key" "$CERT_DIR/ingress.key"
 
-        echo "Signing certificates with the provided CA..."
-        openssl x509 -req -in api.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial \
-            -out api.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${API_HOST}")
-        openssl x509 -req -in ingress.csr -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" -CAcreateserial \
-            -out ingress.crt -days 365 -sha256 -extfile <(printf "subjectAltName=DNS:${INGRESS_WILDCARD},DNS:${CONSOLE_HOST}")
+    openssl req -new -key "$CERT_DIR/api.key" -out "$CERT_DIR/api.csr" \
+        -subj "/CN=${API_HOST}" -reqexts SAN -config "$CERT_DIR/api-req.cnf"
+    openssl req -new -key "$CERT_DIR/ingress.key" -out "$CERT_DIR/ingress.csr" \
+        -subj "/CN=${INGRESS_WILDCARD}" -reqexts SAN -config "$CERT_DIR/ingress-req.cnf"
 
-        echo "Applying custom certificates to the cluster..."
-        cd ../..
-        oc create configmap custom-ca --from-file=ca-bundle.crt="$CA_CERT_FILE" -n openshift-config || true
-        oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"custom-ca"}}}'
+    echo "Signing certificates with the provided CA..."
+    # -CAserial points at the cert dir so ca.srl does not land beside the user's CA.
+    openssl x509 -req -in "$CERT_DIR/api.csr" -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" \
+        -CAcreateserial -CAserial "$CERT_DIR/ca.srl" -out "$CERT_DIR/api.crt" \
+        -days 365 -sha256 -extfile "$CERT_DIR/api-ext.cnf"
+    openssl x509 -req -in "$CERT_DIR/ingress.csr" -CA "$CA_CERT_FILE" -CAkey "$CA_KEY_FILE" \
+        -CAcreateserial -CAserial "$CERT_DIR/ca.srl" -out "$CERT_DIR/ingress.crt" \
+        -days 365 -sha256 -extfile "$CERT_DIR/ingress-ext.cnf"
 
-        oc create secret tls api-tls --cert="$INSTALL_DIR/custom-certs/api.crt" --key="$INSTALL_DIR/custom-certs/api.key" -n openshift-config || true
-        oc create secret tls ingress-tls --cert="$INSTALL_DIR/custom-certs/ingress.crt" --key="$INSTALL_DIR/custom-certs/ingress.key" -n openshift-ingress || true
+    echo "Installing the CA trust bundle and TLS secrets..."
+    oc create configmap custom-ca --from-file=ca-bundle.crt="$CA_CERT_FILE" -n openshift-config || true
+    oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"custom-ca"}}}'
 
-        echo "Patching API server to use the new certificate..."
-        oc patch apiserver/cluster --type=merge --patch='{"spec":{"servingCerts":{"namedCertificates":[{"names":["'"$API_HOST"'"],"servingCertificate":{"name":"api-tls"}}]}}}'
+    oc create secret tls api-tls --cert="$CERT_DIR/api.crt" --key="$CERT_DIR/api.key" -n openshift-config || true
+    oc create secret tls ingress-tls --cert="$CERT_DIR/ingress.crt" --key="$CERT_DIR/ingress.key" -n openshift-ingress || true
 
-        echo "Patching Ingress Controller to use the new certificate..."
-        oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge --patch='{"spec":{"defaultCertificate":{"name":"ingress-tls"}}}'
-
-        echo "--- Custom Certificate Configuration Complete ---"
-        echo "IMPORTANT: import and trust the CA certificate ($CA_CERT_FILE) on your client to avoid browser warnings."
-    )
-
-    echo "Updating kubeconfig to trust the new custom CA..."
-    oc --kubeconfig="$KUBECONFIG" config set-cluster "${CLUSTER_NAME}" --certificate-authority="${CA_CERT_FILE}" --embed-certs=true
+    # CRITICAL ORDERING: trust the CA locally BEFORE the apiserver starts serving
+    # the new cert, or every subsequent oc call loses its connection.
+    echo "Updating local kubeconfig to trust the custom CA (before patching the API server)..."
+    append_ca_to_kubeconfig "$KUBECONFIG" "$CA_CERT_FILE"
     echo "Kubeconfig updated successfully."
+
+    echo "Patching API server to use the new certificate..."
+    oc patch apiserver/cluster --type=merge --patch='{"spec":{"servingCerts":{"namedCertificates":[{"names":["'"$API_HOST"'"],"servingCertificate":{"name":"api-tls"}}]}}}'
+
+    echo "Patching Ingress Controller to use the new certificate..."
+    oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge --patch='{"spec":{"defaultCertificate":{"name":"ingress-tls"}}}'
+
+    echo "Waiting for operators to roll out the new certificates..."
+    wait_co_settled kube-apiserver 2400s   # rolls one revision per control-plane node
+    wait_co_settled ingress        900s
+    wait_co_settled authentication 900s
+    wait_co_settled console        900s
+
+    echo "--- Custom Certificate Configuration Complete ---"
+    echo "IMPORTANT: import and trust the CA certificate ($CA_CERT_FILE) on your client to avoid browser warnings."
 else
     echo "Skipping custom certificate configuration (--skip-certs)."
 fi
