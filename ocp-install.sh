@@ -224,6 +224,38 @@ append_ca_to_kubeconfig() {
     rm -f "$tmp"
 }
 
+# --- Wait until a named object exists -----------------------------------------
+# `oc wait` cannot wait for creation, so poll `oc get` until the object appears.
+# An empty namespace argument means cluster-scoped (no -n flag).
+wait_for_object() {
+    local kind="$1" name="$2" ns="$3" timeout="${4:-300s}"
+    local secs="${timeout%s}" waited=0
+    local nsflag=()
+    [ -n "$ns" ] && nsflag=(-n "$ns")
+    echo "Waiting for ${kind}/${name}${ns:+ in $ns} to appear (timeout ${timeout})..."
+    while ! oc get "$kind" "$name" "${nsflag[@]}" >/dev/null 2>&1; do
+        if [ "$waited" -ge "$secs" ]; then
+            echo "Error: timed out waiting for ${kind}/${name}${ns:+ in $ns} to appear" >&2
+            return 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    echo "${kind}/${name} exists."
+}
+
+# --- ERR trap: never leave a half-built cluster running silently --------------
+# On any failure after provisioning has begun, print the exact destroy command.
+on_err() {
+    local rc=$?
+    echo "ERROR: deployment failed (exit $rc)." >&2
+    if [ -n "${INSTALL_DIR:-}" ] && [ -f "${INSTALL_DIR}/metadata.json" ]; then
+        echo "A cluster may be partially provisioned in AWS. Tear it down with:" >&2
+        echo "  ${OPENSHIFT_INSTALL} destroy cluster --dir=${INSTALL_DIR}" >&2
+    fi
+    exit "$rc"
+}
+
 # --- Preflight: collect ALL errors, then exit once ----------------------------
 preflight() {
     local errors=()
@@ -339,6 +371,9 @@ PULL_SECRET_CONTENT="$(tr -d '\n' < "$PULL_SECRET_FILE")"
 } > "$RENDERED"
 rm -f "$RENDERED.tmp"
 
+# The rendered config embeds the pull secret; lock it down in every mode.
+chmod 600 "$RENDERED"
+
 echo "--- Generated install-config.yaml snippet ---"
 grep -E "baseDomain:|name:|region:|expirationDate:|pullSecret:" "$RENDERED" || true
 echo "------------------------------------------"
@@ -352,6 +387,16 @@ if [ -n "$DRY_RUN" ]; then
     echo "Dry-run: skipping cluster installation and all cluster/AWS operations."
     exit 0
 fi
+
+# From here on, any failure may leave a cluster running in AWS. Surface the
+# destroy command via the ERR trap (dry-run already exited, so it never affects
+# the smoke test).
+trap on_err ERR
+
+# openshift-install consumes install-config.yaml during the run; keep a backup.
+cp "$RENDERED" "$RENDERED.bak"
+chmod 600 "$RENDERED.bak"
+echo "Backed up rendered install-config to $RENDERED.bak (installer consumes the original)."
 
 # --- Start OpenShift cluster installation ------------------------------------
 echo "Starting OpenShift cluster installation in directory: $INSTALL_DIR"
@@ -422,11 +467,15 @@ EOF
         -days 365 -sha256 -extfile "$CERT_DIR/ingress-ext.cnf"
 
     echo "Installing the CA trust bundle and TLS secrets..."
-    oc create configmap custom-ca --from-file=ca-bundle.crt="$CA_CERT_FILE" -n openshift-config || true
+    # Idempotent: generate the manifest client-side, then apply it.
+    oc create configmap custom-ca --from-file=ca-bundle.crt="$CA_CERT_FILE" -n openshift-config \
+        --dry-run=client -o yaml | oc apply -f -
     oc patch proxy/cluster --type=merge --patch='{"spec":{"trustedCA":{"name":"custom-ca"}}}'
 
-    oc create secret tls api-tls --cert="$CERT_DIR/api.crt" --key="$CERT_DIR/api.key" -n openshift-config || true
-    oc create secret tls ingress-tls --cert="$CERT_DIR/ingress.crt" --key="$CERT_DIR/ingress.key" -n openshift-ingress || true
+    oc create secret tls api-tls --cert="$CERT_DIR/api.crt" --key="$CERT_DIR/api.key" -n openshift-config \
+        --dry-run=client -o yaml | oc apply -f -
+    oc create secret tls ingress-tls --cert="$CERT_DIR/ingress.crt" --key="$CERT_DIR/ingress.key" -n openshift-ingress \
+        --dry-run=client -o yaml | oc apply -f -
 
     # CRITICAL ORDERING: trust the CA locally BEFORE the apiserver starts serving
     # the new cert, or every subsequent oc call loses its connection.
@@ -455,25 +504,49 @@ fi
 # --- OpenShift GitOps + Argo CD ----------------------------------------------
 if [ -z "$SKIP_GITOPS" ]; then
     echo "Deploying OpenShift GitOps Operator..."
-    oc create namespace openshift-gitops || true
-    oc create namespace openshift-gitops-operator || true
+    # The operator owns the openshift-gitops namespace; creating it ourselves can
+    # race the operator. Only create the operator's own namespace.
+    oc create namespace openshift-gitops-operator --dry-run=client -o yaml | oc apply -f -
     oc apply -f "$SCRIPT_DIR/gitops-operator-install.yaml"
 
-    echo "Waiting for OpenShift GitOps Operator to be ready..."
+    echo "Waiting for the GitOps operator to be ready..."
+    wait_for_object deployment openshift-gitops-operator-controller-manager openshift-gitops-operator 300s
     oc wait --for=condition=Available deployment/openshift-gitops-operator-controller-manager \
-        -n openshift-gitops-operator --timeout=300s || true
-    echo "OpenShift GitOps Operator deployed."
+        -n openshift-gitops-operator --timeout=300s
+
+    # The operator creates the openshift-gitops namespace and the Argo CD instance.
+    wait_for_object namespace openshift-gitops "" 300s
+    wait_for_object statefulset openshift-gitops-application-controller openshift-gitops 300s
+    oc rollout status statefulset/openshift-gitops-application-controller -n openshift-gitops --timeout=300s
+    echo "OpenShift GitOps is ready."
 
     echo "Deploying Argo CD ClusterRole and ClusterRoleBinding..."
     oc apply -f "$SCRIPT_DIR/cluster-rbac-argocd.yaml"
     echo "Argo CD cluster-wide permissions applied."
 
-    echo "Deploying the Invaders Argo CD Application..."
-    oc apply -f "$SCRIPT_DIR/invaders-application.yaml"
-    echo "Invaders Argo CD Application deployed."
+    # invaders-application.yaml is optional and may not exist in this repo yet.
+    if [ -f "$SCRIPT_DIR/invaders-application.yaml" ]; then
+        echo "Deploying the Invaders Argo CD Application..."
+        oc apply -f "$SCRIPT_DIR/invaders-application.yaml"
+        echo "Invaders Argo CD Application deployed."
+    else
+        echo "Warning: $SCRIPT_DIR/invaders-application.yaml not found; skipping workload deployment."
+    fi
+
+    # Surface the Argo CD UI route.
+    ARGOCD_HOST="$(oc get route openshift-gitops-server -n openshift-gitops \
+        -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+    if [ -n "$ARGOCD_HOST" ]; then
+        echo "Argo CD is available at: https://${ARGOCD_HOST}"
+    else
+        echo "Note: Argo CD route (openshift-gitops-server in openshift-gitops) not found yet."
+    fi
 else
     echo "Skipping OpenShift GitOps deployment (--skip-gitops)."
 fi
+
+# Success: disarm the ERR trap so the destroy hint is not printed on a clean exit.
+trap - ERR
 
 echo "OpenShift Lab Deployment Complete!"
 echo "Tear down the cluster with: $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"

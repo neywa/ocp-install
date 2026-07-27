@@ -204,6 +204,16 @@ else
     FAILS=$((FAILS + 1))
 fi
 
+# The rendered config embeds the pull secret and must be locked down.
+if [ -n "$RENDERED" ]; then
+    mode="$(stat -c '%a' "$RENDERED")"
+    if [ "$mode" = "600" ]; then
+        pass "rendered install-config.yaml is mode 600"
+    else
+        fail "rendered install-config.yaml mode is $mode, expected 600"
+    fi
+fi
+
 # =============================================================================
 echo
 echo "== Test 2: CLI flag overrides lab.env (flag wins) =="

@@ -38,9 +38,22 @@ The AWS environment must be prepared beforehand (see the README).
    **before** patching `apiserver/cluster`, so the client keeps trusting the API
    once it serves the new cert. Patch `apiserver/cluster` + `ingresscontroller/default`,
    then `wait_co_settled` for kube-apiserver (2400s), ingress, authentication, console.
-9. **OpenShift GitOps + Argo CD** (skipped by `--skip-gitops`) — create namespaces,
-   apply `gitops-operator-install.yaml`, `cluster-rbac-argocd.yaml`, and
-   `invaders-application.yaml`.
+9. **OpenShift GitOps + Argo CD** (skipped by `--skip-gitops`) — create only the
+   `openshift-gitops-operator` namespace (the operator owns `openshift-gitops`),
+   apply `gitops-operator-install.yaml`, then `wait_for_object` + `oc wait`/`rollout
+   status` through the operator deployment → `openshift-gitops` namespace → the
+   `openshift-gitops-application-controller` statefulset. Apply
+   `cluster-rbac-argocd.yaml`; apply `invaders-application.yaml` **only if present**
+   (warn otherwise); print the Argo CD route.
+
+Day-2 cluster mutations are **idempotent and rerunnable**: every `oc create`
+(namespace/secret/configmap) uses `oc create … --dry-run=client -o yaml | oc apply
+-f -`, not `oc create … || true`. Once provisioning begins, an **ERR trap** prints
+the exact `openshift-install destroy cluster --dir=…` command (guarded on
+`metadata.json`) so a half-built cluster is never left silently in AWS; it is
+cleared before the success banner. The rendered `install-config.yaml` embeds the
+pull secret — it is `chmod 600` and copied to `install-config.yaml.bak` before the
+installer consumes it.
 
 **`CLUSTER_NAME` is the single source of truth.** It drives `metadata.name` in
 install-config **and** the derived hostnames — `api.${CLUSTER_NAME}.${BASE_DOMAIN}`,
