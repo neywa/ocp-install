@@ -100,6 +100,39 @@ $ bash -n ocp-install.sh     # syntax
 $ bash test/smoke.sh         # renders in --dry-run against throwaway fixtures
 ```
 
+## Open questions
+
+### Is `cluster-rbac-argocd.yaml` (Argo CD cluster-admin) actually needed?
+
+`cluster-rbac-argocd.yaml` grants the `openshift-gitops` application controller
+**cluster-admin**. The hypothesis is that it is redundant — the Red Hat OpenShift
+GitOps operator already grants the default `openshift-gitops` Argo CD instance
+cluster-scoped permissions when it creates the instance. It is applied only when
+`ARGOCD_CLUSTER_RBAC=true`; the default is **off** so the next build tests this.
+
+To test:
+
+1. Build a lab with the default (`ARGOCD_CLUSTER_RBAC` unset/`false`).
+2. Deploy the Invaders Argo CD `Application` and watch whether it **syncs** to
+   `Synced` / `Healthy`.
+3. If it fails on permissions, look in two places:
+   - The `Application` status — a permission-denied condition:
+     ```
+     oc get application <name> -n openshift-gitops -o yaml
+     ```
+     look under `status.conditions` / `status.operationState` for a
+     `ComparisonError` / `SyncError` with `... cannot get resource ... is forbidden`.
+   - The application-controller logs — the matching RBAC denial:
+     ```
+     oc logs statefulset/openshift-gitops-application-controller -n openshift-gitops | grep -i forbidden
+     ```
+
+Outcome:
+- **Syncs without it** → the manifest is redundant; delete `cluster-rbac-argocd.yaml`.
+- **Fails without it** → set `ARGOCD_CLUSTER_RBAC=true` in `lab.env` and rerun; the
+  grant is required (and should then be scoped down with an AppProject rather than
+  left as cluster-admin).
+
 ## Next steps
 - Automate the dummy workload deployment
     - Dummy workload is available in my https://github.com/neywa/retro-arcade-hub repo

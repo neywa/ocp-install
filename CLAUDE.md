@@ -44,8 +44,10 @@ The AWS environment must be prepared beforehand (see the README).
    apply `gitops-operator-install.yaml`, then `wait_for_object` + `oc wait`/`rollout
    status` through the operator deployment → `openshift-gitops` namespace → the
    `openshift-gitops-application-controller` statefulset. Apply
-   `cluster-rbac-argocd.yaml`; apply `invaders-application.yaml` **only if present**
-   (warn otherwise); print the Argo CD route.
+   `cluster-rbac-argocd.yaml` **only when `ARGOCD_CLUSTER_RBAC=true`** (default
+   `false` — it grants cluster-admin and may be redundant; see README "Open
+   questions"); apply `invaders-application.yaml` **only if present** (warn
+   otherwise); print the Argo CD route.
 
 Day-2 cluster mutations are **idempotent and rerunnable**: every `oc create`
 (namespace/secret/configmap) uses `oc create … --dry-run=client -o yaml | oc apply
@@ -69,7 +71,8 @@ environment < CLI flags**. `lab.env` (gitignored; copy from `lab.env.example`) u
 the `: "${VAR:=value}"` form so it never clobbers a value already in the
 environment. Overridable vars: `CLUSTER_NAME`, `AWS_REGION`, replicas, instance
 types, `OWNER`, `PURPOSE`, `TTL_DAYS`, `OCP_VERSION`, `WORKDIR_ROOT`,
-`PULL_SECRET_FILE`, `INSTALL_CONFIG_TEMPLATE`, `CA_KEY_FILE`, `CA_CERT_FILE`. Paths
+`PULL_SECRET_FILE`, `INSTALL_CONFIG_TEMPLATE`, `CA_KEY_FILE`, `CA_CERT_FILE`,
+`ARGOCD_CLUSTER_RBAC`. Paths
 default repo-relative — **no personal absolute paths**. `LAB_ENV` (env only) points
 at the config file; the smoke test uses it to inject a scratch `lab.env`.
 

@@ -148,6 +148,10 @@ fi
 : "${INSTALL_CONFIG_TEMPLATE:=$SCRIPT_DIR/install-config-template.yaml}"
 : "${CA_KEY_FILE:=$SCRIPT_DIR/certs/ca.key}"
 : "${CA_CERT_FILE:=$SCRIPT_DIR/certs/ca.crt}"
+# Argo CD cluster-admin RBAC toggle (see cluster-rbac-argocd.yaml). Default off:
+# test whether the GitOps operator's built-in permissions suffice; set to true in
+# lab.env only if Argo CD sync fails on missing permissions.
+: "${ARGOCD_CLUSTER_RBAC:=false}"
 # BASE_DOMAIN has no default; it is required.
 : "${BASE_DOMAIN:=}"
 
@@ -559,9 +563,19 @@ if [ -z "$SKIP_GITOPS" ]; then
     oc rollout status statefulset/openshift-gitops-application-controller -n openshift-gitops --timeout=300s
     echo "OpenShift GitOps is ready."
 
-    echo "Deploying Argo CD ClusterRole and ClusterRoleBinding..."
-    oc apply -f "$SCRIPT_DIR/cluster-rbac-argocd.yaml"
-    echo "Argo CD cluster-wide permissions applied."
+    case "${ARGOCD_CLUSTER_RBAC,,}" in
+        true|1|yes|on)
+            echo "Applying Argo CD cluster-admin RBAC (ARGOCD_CLUSTER_RBAC=$ARGOCD_CLUSTER_RBAC)..."
+            echo "  WARNING: grants the application controller cluster-admin — it can read every Secret in every namespace."
+            oc apply -f "$SCRIPT_DIR/cluster-rbac-argocd.yaml"
+            echo "Argo CD cluster-wide permissions applied."
+            ;;
+        *)
+            echo "Skipping Argo CD cluster-admin RBAC (ARGOCD_CLUSTER_RBAC=$ARGOCD_CLUSTER_RBAC)."
+            echo "  Testing whether the GitOps operator's built-in permissions suffice."
+            echo "  If Argo CD sync fails with permission-denied errors, set ARGOCD_CLUSTER_RBAC=true in lab.env and rerun."
+            ;;
+    esac
 
     # invaders-application.yaml is optional and may not exist in this repo yet.
     if [ -f "$SCRIPT_DIR/invaders-application.yaml" ]; then
