@@ -148,10 +148,12 @@ fi
 : "${INSTALL_CONFIG_TEMPLATE:=$SCRIPT_DIR/install-config-template.yaml}"
 : "${CA_KEY_FILE:=$SCRIPT_DIR/certs/ca.key}"
 : "${CA_CERT_FILE:=$SCRIPT_DIR/certs/ca.crt}"
-# Argo CD cluster-admin RBAC toggle (see cluster-rbac-argocd.yaml). Default off:
-# test whether the GitOps operator's built-in permissions suffice; set to true in
-# lab.env only if Argo CD sync fails on missing permissions.
-: "${ARGOCD_CLUSTER_RBAC:=false}"
+# Workload namespaces the openshift-gitops Argo CD instance should manage. Each is
+# labeled argocd.argoproj.io/managed-by=openshift-gitops (the GitOps operator then
+# grants the application controller NAMESPACE-SCOPED rights there) plus a small
+# monitoring Role — never cluster-admin. Must match the destination namespace(s) of
+# the Argo CD Applications you deploy (see invaders-application.yaml). Space-separated.
+: "${ARGOCD_MANAGED_NAMESPACES:=retro-invaders}"
 # BASE_DOMAIN has no default; it is required.
 : "${BASE_DOMAIN:=}"
 
@@ -265,6 +267,31 @@ wait_for_object() {
         waited=$((waited + 5))
     done
     echo "${kind}/${name} exists."
+}
+
+# --- Scope Argo CD to a workload namespace (no cluster-admin) -----------------
+# The default openshift-gitops Argo CD instance can only manage namespaces it is
+# authorized for; an arbitrary target namespace gets "forbidden" on every apply.
+# Label it argocd.argoproj.io/managed-by=openshift-gitops so the GitOps operator
+# grants the application controller NAMESPACE-SCOPED rights there, then add a small
+# Role for the monitoring CRDs (PrometheusRule/Probe) the operator's managed-
+# namespace role does not cover. Everything stays namespaced — the controller gains
+# no cross-namespace or Secret-read access. Idempotent (create|apply). See README
+# "Open questions".
+grant_argocd_namespace() {
+    local ns="$1"
+    local sa="openshift-gitops:openshift-gitops-argocd-application-controller"
+    echo "Scoping Argo CD to namespace '$ns' (managed-by label + monitoring role)..."
+    oc create namespace "$ns" --dry-run=client -o yaml | oc apply -f -
+    oc label namespace "$ns" argocd.argoproj.io/managed-by=openshift-gitops --overwrite
+    oc create role argocd-monitoring-manager -n "$ns" \
+        --verb=get,list,watch,create,update,patch,delete \
+        --resource=prometheusrules.monitoring.coreos.com,probes.monitoring.coreos.com \
+        --dry-run=client -o yaml | oc apply -f -
+    oc create rolebinding argocd-monitoring-manager -n "$ns" \
+        --role=argocd-monitoring-manager \
+        --serviceaccount="$sa" \
+        --dry-run=client -o yaml | oc apply -f -
 }
 
 # --- ERR trap: never leave a half-built cluster running silently --------------
@@ -563,19 +590,18 @@ if [ -z "$SKIP_GITOPS" ]; then
     oc rollout status statefulset/openshift-gitops-application-controller -n openshift-gitops --timeout=300s
     echo "OpenShift GitOps is ready."
 
-    case "${ARGOCD_CLUSTER_RBAC,,}" in
-        true|1|yes|on)
-            echo "Applying Argo CD cluster-admin RBAC (ARGOCD_CLUSTER_RBAC=$ARGOCD_CLUSTER_RBAC)..."
-            echo "  WARNING: grants the application controller cluster-admin — it can read every Secret in every namespace."
-            oc apply -f "$SCRIPT_DIR/cluster-rbac-argocd.yaml"
-            echo "Argo CD cluster-wide permissions applied."
-            ;;
-        *)
-            echo "Skipping Argo CD cluster-admin RBAC (ARGOCD_CLUSTER_RBAC=$ARGOCD_CLUSTER_RBAC)."
-            echo "  Testing whether the GitOps operator's built-in permissions suffice."
-            echo "  If Argo CD sync fails with permission-denied errors, set ARGOCD_CLUSTER_RBAC=true in lab.env and rerun."
-            ;;
-    esac
+    # Grant the application controller scoped, namespace-local permissions in each
+    # workload namespace. The default openshift-gitops instance cannot manage
+    # arbitrary namespaces on its own, and cluster-admin would be wildly over-broad
+    # (read every Secret in every namespace); managed-by scoping is the supported,
+    # least-privilege alternative.
+    if [ -n "${ARGOCD_MANAGED_NAMESPACES// }" ]; then
+        for ns in $ARGOCD_MANAGED_NAMESPACES; do
+            grant_argocd_namespace "$ns"
+        done
+    else
+        echo "No ARGOCD_MANAGED_NAMESPACES set; skipping Argo CD namespace scoping."
+    fi
 
     # invaders-application.yaml is optional and may not exist in this repo yet.
     if [ -f "$SCRIPT_DIR/invaders-application.yaml" ]; then

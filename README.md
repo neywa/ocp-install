@@ -67,6 +67,48 @@ Behaviour:
   -h, --help                        Show help and exit
 ```
 
+Both `--flag value` and `--flag=value` are accepted. `-d`/`--base-domain` is the
+only required setting; it has no default.
+
+### Environment / `lab.env` variables (no CLI flag)
+
+Everything in the flag list above can also be set under the same name in `lab.env`
+or the environment (the flag just wins). The variables below have **no flag** —
+set them in `lab.env` or export them:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OWNER` | `rbobek` | `userTags.owner` (AWS tag). |
+| `PURPOSE` | `lab` | `userTags.purpose` (AWS tag). |
+| `OCP_VERSION` | *(empty)* | If set, prefer the `./<version>/openshift-install` binary. |
+| `WORKDIR_ROOT` | `./clusters` | Fixed parent for all per-run install dirs (the whole tree is gitignored). |
+| `PULL_SECRET_FILE` | `./pull-secret.txt` | Path to the OpenShift pull secret. |
+| `CA_KEY_FILE` | `./certs/ca.key` | Local CA private key (custom certs). |
+| `CA_CERT_FILE` | `./certs/ca.crt` | Local CA certificate. |
+| `ARGOCD_MANAGED_NAMESPACES` | `retro-invaders` | Space-separated workload namespaces to scope Argo CD to (managed-by label + monitoring role, no cluster-admin). Must match your Applications' destination namespaces. See [Resolved](#resolved). |
+| `LAB_ENV` | `./lab.env` | Path to the config file itself (env-only; used by the smoke test). |
+
+`INSTALL_CONFIG_TEMPLATE` (the `-f`/`--config` target) defaults to
+`./install-config-template.yaml`.
+
+## What the script does
+
+Run in order, each phase gated as noted:
+
+1. **Parse & resolve config**, then **preflight** — collects *all* errors at once
+   (required tools; pull secret present and JSON-shaped; template and CA files;
+   and, if `aws` is installed, `sts get-caller-identity` + a Route53 zone check).
+2. **Create the per-run install dir** `WORKDIR_ROOT/<cluster>-YYYYMMDD-HHMMSS` (`0700`).
+3. **Render `install-config.yaml`** — pull secret injected safely, `chmod 600`, plus
+   a redacted `.bak`. **`--dry-run` exits here** — nothing below touches AWS.
+4. **Create the cluster** (`openshift-install create cluster`) and wait for core operators.
+5. **Custom certificates** *(skipped by `--skip-certs`)* — CA-signed API + Ingress
+   certs, trust wiring, and apiserver/ingress patches.
+6. **OpenShift GitOps + Argo CD** *(skipped by `--skip-gitops`)* — install the
+   operator, wait for Argo CD, scope Argo CD to each `ARGOCD_MANAGED_NAMESPACES`
+   namespace (managed-by label + monitoring Role, not cluster-admin), apply
+   `invaders-application.yaml` if present, and print the Argo CD route.
+
 ## AWS resource tagging
 
 Every AWS resource the installer creates is tagged via `platform.aws.userTags`:
@@ -100,38 +142,40 @@ $ bash -n ocp-install.sh     # syntax
 $ bash test/smoke.sh         # renders in --dry-run against throwaway fixtures
 ```
 
-## Open questions
+## Resolved
 
-### Is `cluster-rbac-argocd.yaml` (Argo CD cluster-admin) actually needed?
+### Argo CD permissions: scoped per-namespace, not cluster-admin
 
-`cluster-rbac-argocd.yaml` grants the `openshift-gitops` application controller
-**cluster-admin**. The hypothesis is that it is redundant — the Red Hat OpenShift
-GitOps operator already grants the default `openshift-gitops` Argo CD instance
-cluster-scoped permissions when it creates the instance. It is applied only when
-`ARGOCD_CLUSTER_RBAC=true`; the default is **off** so the next build tests this.
+The repo used to carry `cluster-rbac-argocd.yaml`, a ClusterRole granting the
+`openshift-gitops` application controller **cluster-admin** (read every Secret in
+every namespace). The open question was whether it was even needed — the hypothesis
+being that the OpenShift GitOps operator already grants the default instance enough.
 
-To test:
+**Tested (RBAC off) — result: not redundant, but cluster-admin was the wrong fix.**
+With no grant, the Invaders `Application` failed to sync with `SyncError`s:
+```
+services / deployments.apps / routes.route.openshift.io /
+prometheusrules.monitoring.coreos.com / probes.monitoring.coreos.com is forbidden:
+User "system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller" ...
+```
+Every forbidden resource is **namespaced** and in the **single target namespace**
+(`retro-invaders`). The controller wasn't missing cluster-wide power — it was
+missing permission in a namespace it was never authorized to manage. The default
+`openshift-gitops` instance only manages `openshift-gitops` plus namespaces labeled
+`argocd.argoproj.io/managed-by=openshift-gitops`; the auto-created target had no
+such label.
 
-1. Build a lab with the default (`ARGOCD_CLUSTER_RBAC` unset/`false`).
-2. Deploy the Invaders Argo CD `Application` and watch whether it **syncs** to
-   `Synced` / `Healthy`.
-3. If it fails on permissions, look in two places:
-   - The `Application` status — a permission-denied condition:
-     ```
-     oc get application <name> -n openshift-gitops -o yaml
-     ```
-     look under `status.conditions` / `status.operationState` for a
-     `ComparisonError` / `SyncError` with `... cannot get resource ... is forbidden`.
-   - The application-controller logs — the matching RBAC denial:
-     ```
-     oc logs statefulset/openshift-gitops-application-controller -n openshift-gitops | grep -i forbidden
-     ```
+**Fix (implemented):** the script now scopes Argo CD per namespace instead of
+granting cluster-admin. For each namespace in `ARGOCD_MANAGED_NAMESPACES` (default
+`retro-invaders`) it:
+1. creates the namespace and labels it `argocd.argoproj.io/managed-by=openshift-gitops`,
+   so the operator reconciles a **namespace-scoped** RoleBinding for the controller; and
+2. adds a small namespaced Role for the monitoring CRDs (`prometheusrules`, `probes`)
+   that the operator's managed-namespace role doesn't cover.
 
-Outcome:
-- **Syncs without it** → the manifest is redundant; delete `cluster-rbac-argocd.yaml`.
-- **Fails without it** → set `ARGOCD_CLUSTER_RBAC=true` in `lab.env` and rerun; the
-  grant is required (and should then be scoped down with an AppProject rather than
-  left as cluster-admin).
+The controller can now manage `retro-invaders` and nothing outside it — no
+cross-namespace or Secret-read access. `cluster-rbac-argocd.yaml` has been deleted.
+Set `ARGOCD_MANAGED_NAMESPACES` to match your Applications' destination namespaces.
 
 ## Next steps
 - Automate the dummy workload deployment
