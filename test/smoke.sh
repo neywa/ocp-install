@@ -104,6 +104,17 @@ case "${1:-}" in
         [ -f "$f" ] && cat "$f"
         exit 0
     fi
+    # Simulate a worker pool for the --add capacity check. STUB_NODE_CPU/STUB_NODE_MEM
+    # describe a single worker node (defaults to a small m6i.xlarge-ish one).
+    if [ "${2:-}" = "nodes" ]; then
+        if printf '%s\n' "$@" | grep -q 'allocatable.cpu'; then
+            printf '%s' "${STUB_NODE_CPU:-3500m}"; exit 0
+        elif printf '%s\n' "$@" | grep -q 'allocatable.memory'; then
+            printf '%s' "${STUB_NODE_MEM:-15000000Ki}"; exit 0
+        else
+            echo "node/worker-0"; exit 0     # -o name -> one worker node
+        fi
+    fi
     ;;
 esac
 # Drain piped stdin (`oc apply -f -`) so an upstream `oc create … |` writer never
@@ -656,10 +667,10 @@ else
 fi
 # The install dir records the module so teardown/--remove know to clean it up.
 STATE13B="$(find "$SCRATCH/run13b" -maxdepth 3 -name modules.state -type f | head -n1)"
-if [ -n "$STATE13B" ] && grep -qx "hello" "$STATE13B"; then
-    pass "modules.state records the installed module"
+if [ -n "$STATE13B" ] && grep -qE "^hello installed$" "$STATE13B"; then
+    pass "modules.state records the installed module (status installed)"
 else
-    fail "modules.state did not record the installed module"
+    fail "modules.state did not record the installed module as installed"
 fi
 
 # -----------------------------------------------------------------------------
@@ -680,6 +691,143 @@ print("  PASS: install-config renders and stays valid with a module enabled" if 
 sys.exit(0 if ok else 1)
 PY
 then :; else FAILS=$((FAILS + 1)); fi
+
+# -----------------------------------------------------------------------------
+# Helper: a fake existing-cluster --dir (auth/kubeconfig + optional state lines).
+mk_cluster_dir() {
+    local dir="$1"; shift
+    mkdir -p "$dir/auth"; : > "$dir/auth/kubeconfig"
+    : > "$dir/modules.state"
+    local line; for line in "$@"; do echo "$line" >> "$dir/modules.state"; done
+}
+
+echo
+echo "== Test 15: --add capacity check sums allocatable CPU/mem, not node count =="
+mkdir -p "$MODS/cap/heavy"
+cat > "$MODS/cap/heavy/module.sh" <<'EOF'
+MODULE_DESCRIPTION="heavy module with an allocatable floor"
+MODULE_MIN_CPU="8"
+MODULE_MIN_MEMORY="32"
+MODULE_CREATES_AWS="false"
+heavy_install() { echo "PHASE:install:heavy"; }
+EOF
+CL15="$SCRATCH/cluster15"; mk_cluster_dir "$CL15"
+# One undersized worker (3.5 CPU / ~14Gi): node count is 1, which the OLD check waved
+# through; the capacity gate must reject it.
+set +e
+out15="$(run_ocp run15 MODULES_DIR="$MODS/cap" STUB_NODE_CPU=3500m STUB_NODE_MEM=15000000Ki \
+    -- --add heavy --dir "$CL15" 2>&1)"
+rc15=$?
+set -e
+if [ "$rc15" -ne 0 ] && grep -q "needs >= 8 CPU" <<<"$out15"; then
+    pass "capacity check rejected a single undersized node (allocatable < floor)"
+else
+    echo "$out15"; fail "capacity check did not reject the undersized node"
+fi
+# A big-enough worker passes the gate.
+CL15B="$SCRATCH/cluster15b"; mk_cluster_dir "$CL15B"
+set +e
+out15b="$(run_ocp run15b MODULES_DIR="$MODS/cap" STUB_NODE_CPU=16000m STUB_NODE_MEM=70000000Ki \
+    -- --add heavy --dir "$CL15B" 2>&1)"
+rc15b=$?
+set -e
+if [ "$rc15b" -eq 0 ] && ! grep -q "needs >=" <<<"$out15b"; then
+    pass "capacity check passed when allocatable meets the floor"
+else
+    echo "$out15b"; fail "capacity check wrongly rejected an adequate cluster"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 16: a half-failed install is still recorded (so destroy will run) =="
+mkdir -p "$MODS/pf/halffail"
+cat > "$MODS/pf/halffail/module.sh" <<'EOF'
+MODULE_DESCRIPTION="module whose install creates something then fails"
+MODULE_CREATES_AWS="false"
+# Simulate: the Subscription applies, but readiness never comes -> install fails.
+halffail_install() { oc apply -f - >/dev/null 2>&1 <<<'kind: Subscription'; return 1; }
+halffail_destroy() { :; }
+EOF
+set +e
+out16="$(run_ocp run16 MODULES_DIR="$MODS/pf" -- \
+    -d smoke.example.com --with halffail --skip-certs --skip-gitops 2>&1)"
+rc16=$?
+set -e
+STATE16="$(find "$SCRATCH/run16" -maxdepth 3 -name modules.state -type f | head -n1)"
+if [ "$rc16" -ne 0 ] && [ -n "$STATE16" ] && grep -qE "^halffail failed$" "$STATE16"; then
+    pass "half-failed module recorded as 'failed' in state (destroy will cover it)"
+else
+    echo "--- state ---"; [ -n "$STATE16" ] && cat "$STATE16"; echo "rc=$rc16"
+    fail "half-failed module was not recorded for cleanup"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 17: --teardown runs destroy hooks, THEN destroys the cluster =="
+mkdir -p "$MODS/td/tdmod"
+cat > "$MODS/td/tdmod/module.sh" <<'EOF'
+MODULE_DESCRIPTION="teardown probe module"
+MODULE_CREATES_AWS="false"
+tdmod_install() { :; }
+tdmod_destroy() { echo "DESTROY:tdmod"; }
+EOF
+CL17="$SCRATCH/cluster17"; mk_cluster_dir "$CL17" "tdmod installed"
+set +e
+out17="$(run_ocp run17 MODULES_DIR="$MODS/td" -- --teardown --dir "$CL17" 2>&1)"
+rc17=$?
+set -e
+echo "$out17" > "$SCRATCH/td17.log"
+d_line="$(grep -n 'DESTROY:tdmod' "$SCRATCH/td17.log" | head -n1 | cut -d: -f1)"
+c_line="$(grep -n 'STUB openshift-install: destroy cluster' "$SCRATCH/td17.log" | head -n1 | cut -d: -f1)"
+if [ "$rc17" -eq 0 ] && [ -n "$d_line" ] && [ -n "$c_line" ] && [ "$d_line" -lt "$c_line" ]; then
+    pass "destroy hook ran before the cluster destroy"
+else
+    echo "$out17"; fail "teardown ordering wrong (destroy hook must precede cluster destroy)"
+fi
+if [ -f "$CL17/modules.state" ] && ! grep -q "tdmod" "$CL17/modules.state"; then
+    pass "teardown cleared the module from state"
+else
+    fail "teardown did not clear the module from state"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 18: a failing destroy hook blocks the cluster destroy =="
+mkdir -p "$MODS/td/tdfail"
+cat > "$MODS/td/tdfail/module.sh" <<'EOF'
+MODULE_DESCRIPTION="teardown probe whose destroy fails"
+MODULE_CREATES_AWS="true"
+tdfail_install() { :; }
+tdfail_destroy() { echo "DESTROY:tdfail attempted"; return 1; }
+EOF
+CL18="$SCRATCH/cluster18"; mk_cluster_dir "$CL18" "tdfail installed"
+set +e
+out18="$(run_ocp run18 MODULES_DIR="$MODS/td" -- --teardown --dir "$CL18" 2>&1)"
+rc18=$?
+set -e
+if [ "$rc18" -ne 0 ] && ! grep -q "STUB openshift-install: destroy cluster" <<<"$out18" \
+   && grep -qi "NOT destroying the cluster" <<<"$out18"; then
+    pass "failed destroy hook aborted before cluster destroy (no orphaned bucket)"
+else
+    echo "$out18"; fail "failed destroy hook did not block the cluster destroy"
+fi
+if [ -f "$CL18/modules.state" ] && grep -q "tdfail" "$CL18/modules.state"; then
+    pass "failed module left in state for a retry"
+else
+    fail "failed module was wrongly cleared from state"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 19: --teardown without --dir fails clearly =="
+set +e
+out19="$(run_ocp run19 MODULES_DIR="$MODS/td" -- --teardown 2>&1)"; rc19=$?
+set -e
+if [ "$rc19" -ne 0 ] && grep -q -- "--dir" <<<"$out19"; then
+    pass "--teardown without --dir failed clearly"
+else
+    echo "$out19"; fail "--teardown without --dir did not fail clearly"
+fi
 
 # =============================================================================
 echo

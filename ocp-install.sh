@@ -47,7 +47,8 @@ Modules (optional products, see --list-modules):
       --list-modules                List available modules with descriptions/floors and exit
       --add <a,b>                   Install modules into an EXISTING cluster (needs --dir)
       --remove <a,b>                Destroy modules in an EXISTING cluster (needs --dir)
-      --dir <path>                  Install dir to target for --add / --remove
+      --teardown                    Destroy all installed modules then the cluster (needs --dir)
+      --dir <path>                  Install dir to target for --add / --remove / --teardown
 
 Behaviour:
       --dry-run                     Render install-config.yaml and exit (no cluster/AWS)
@@ -141,6 +142,7 @@ while [ $# -gt 0 ]; do
         --remove)
             [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
             REMOVE_MODULES="${REMOVE_MODULES:+$REMOVE_MODULES,}$val"; MODE="remove" ;;
+        --teardown)    MODE="teardown" ;;
         --dir)
             [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
             TARGET_DIR="$val" ;;
@@ -340,7 +342,8 @@ grant_argocd_namespace() {
 # globals a module sets at source time are snapshotted here into per-module arrays;
 # hooks are functions named <name>_<hook> so two modules never collide. See CLAUDE.md.
 
-declare -A MOD_DESCRIPTION MOD_REQUIRES MOD_MIN_WORKERS MOD_MIN_WORKER_TYPE MOD_CREATES_AWS MOD_LOADED MOD_FAILED
+declare -A MOD_DESCRIPTION MOD_REQUIRES MOD_MIN_WORKERS MOD_MIN_WORKER_TYPE \
+           MOD_MIN_CPU MOD_MIN_MEMORY MOD_CREATES_AWS MOD_LOADED MOD_FAILED
 RESOLVED_ORDER=()      # dependency-resolved, deterministic install order
 MODULE_FAILURES=()     # "<module> (<phase>)" entries for the end-of-run summary
 
@@ -374,7 +377,8 @@ load_module() {
     [ -n "${MOD_LOADED[$name]:-}" ] && return 0
     local file="$MODULES_DIR/$name/module.sh"
     [ -f "$file" ] || die "module '$name' not found (expected $file)"
-    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE MODULE_CREATES_AWS
+    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE \
+          MODULE_MIN_CPU MODULE_MIN_MEMORY MODULE_CREATES_AWS
     # shellcheck disable=SC1090
     source "$file"
     [ -n "${MODULE_DESCRIPTION:-}" ] || die "module '$name' is malformed: MODULE_DESCRIPTION is not set"
@@ -383,9 +387,12 @@ load_module() {
     MOD_REQUIRES[$name]="${MODULE_REQUIRES:-}"
     MOD_MIN_WORKERS[$name]="${MODULE_MIN_WORKERS:-}"
     MOD_MIN_WORKER_TYPE[$name]="${MODULE_MIN_WORKER_TYPE:-}"
+    MOD_MIN_CPU[$name]="${MODULE_MIN_CPU:-}"
+    MOD_MIN_MEMORY[$name]="${MODULE_MIN_MEMORY:-}"
     MOD_CREATES_AWS[$name]="${MODULE_CREATES_AWS:-false}"
     MOD_LOADED[$name]=1
-    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE MODULE_CREATES_AWS
+    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE \
+          MODULE_MIN_CPU MODULE_MIN_MEMORY MODULE_CREATES_AWS
 }
 
 # DFS with gray/black marking: expand REQUIRES transitively, detect cycles, and emit
@@ -457,34 +464,68 @@ resolve_sizing() {
     fi
 }
 
-# --add only: sizing cannot be applied to a live cluster, so its capacity must
-# already meet the floor. Prints an error and returns 1 on a shortfall.
+# Parse a Kubernetes CPU quantity to integer millicores ("3500m" -> 3500, "8" -> 8000).
+_cpu_to_millicores() {
+    local v="$1"
+    if [ "${v: -1}" = "m" ]; then echo "${v%m}"; else awk "BEGIN{printf \"%d\", $v*1000}"; fi
+}
+# Parse a Kubernetes memory quantity to integer Ki ("16000000Ki", "31Gi", "64Mi", bytes).
+_mem_to_ki() {
+    local v="$1"
+    case "$v" in
+        *Ki) echo "${v%Ki}" ;;
+        *Mi) awk "BEGIN{printf \"%d\", ${v%Mi}*1024}" ;;
+        *Gi) awk "BEGIN{printf \"%d\", ${v%Gi}*1024*1024}" ;;
+        *[!0-9]*) echo 0 ;;                                  # unknown suffix -> ignore
+        *) awk "BEGIN{printf \"%d\", $v/1024}" ;;            # plain bytes
+    esac
+}
+
+# --add only: sizing cannot be applied to a live cluster, so its capacity must already
+# meet the floor. This compares the module's floor against the SUMMED ALLOCATABLE CPU and
+# memory of the worker nodes (not node count — a single node of 1 vs a floor of 1 would
+# wave a too-small cluster through; the whole reason this exists is products like
+# MultiClusterHub refusing to schedule on one m6i.xlarge). Prints each shortfall and
+# returns 1 if any. MODULE_MIN_CPU is aggregate cores; MODULE_MIN_MEMORY is aggregate GiB.
 check_live_capacity() {
     local m="$1"
-    local need_w="${MOD_MIN_WORKERS[$m]:-}" need_t="${MOD_MIN_WORKER_TYPE[$m]:-}"
-    [ -n "$need_w$need_t" ] || return 0
-    local worker_count
-    worker_count="$(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null | wc -l | tr -d ' ')"
-    if [ -n "$need_w" ] && [ "${worker_count:-0}" -lt "$need_w" ]; then
-        echo "module '$m' needs >= $need_w worker node(s) but the cluster has ${worker_count:-0}"
-        return 1
-    fi
-    if [ -n "$need_t" ]; then
-        local need_r="${WORKER_TYPE_RANK[$need_t]:-}"
-        [ -n "$need_r" ] || { echo "module '$m' requires worker type '$need_t' not in WORKER_TYPE_RANK"; return 1; }
-        local types best=0 t
-        types="$(oc get nodes -l node-role.kubernetes.io/worker \
-            -o jsonpath='{.items[*].metadata.labels.node\.kubernetes\.io/instance-type}' 2>/dev/null || true)"
-        for t in $types; do
-            local r="${WORKER_TYPE_RANK[$t]:-0}"
-            [ "$r" -gt "$best" ] && best="$r"
-        done
-        if [ "$best" -lt "$need_r" ]; then
-            echo "module '$m' needs worker type >= $need_t but the cluster's largest worker is below that"
-            return 1
+    local need_w="${MOD_MIN_WORKERS[$m]:-}" need_cpu="${MOD_MIN_CPU[$m]:-}" need_mem="${MOD_MIN_MEMORY[$m]:-}"
+    [ -n "$need_w$need_cpu$need_mem" ] || return 0
+    local shortfalls=0 sel="node-role.kubernetes.io/worker"
+
+    # Optional secondary node-count guard (e.g. anti-affinity spread needs N nodes).
+    if [ -n "$need_w" ]; then
+        local worker_count
+        worker_count="$(oc get nodes -l "$sel" -o name 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "${worker_count:-0}" -lt "$need_w" ]; then
+            echo "module '$m' needs >= $need_w worker node(s) but the cluster has ${worker_count:-0}"
+            shortfalls=1
         fi
     fi
-    return 0
+
+    # Primary capacity gate: summed allocatable CPU / memory across worker nodes.
+    if [ -n "$need_cpu" ] || [ -n "$need_mem" ]; then
+        local cpus mems tot_m=0 tot_ki=0 v
+        cpus="$(oc get nodes -l "$sel" -o jsonpath='{.items[*].status.allocatable.cpu}' 2>/dev/null || true)"
+        mems="$(oc get nodes -l "$sel" -o jsonpath='{.items[*].status.allocatable.memory}' 2>/dev/null || true)"
+        for v in $cpus; do tot_m=$(( tot_m + $(_cpu_to_millicores "$v") )); done
+        for v in $mems; do tot_ki=$(( tot_ki + $(_mem_to_ki "$v") )); done
+        if [ -n "$need_cpu" ]; then
+            local req_m; req_m="$(awk "BEGIN{printf \"%d\", $need_cpu*1000}")"
+            if [ "$tot_m" -lt "$req_m" ]; then
+                echo "module '$m' needs >= ${need_cpu} CPU (allocatable) but workers total $(awk "BEGIN{printf \"%.1f\", $tot_m/1000}")"
+                shortfalls=1
+            fi
+        fi
+        if [ -n "$need_mem" ]; then
+            local req_ki; req_ki="$(awk "BEGIN{printf \"%d\", $need_mem*1024*1024}")"
+            if [ "$tot_ki" -lt "$req_ki" ]; then
+                echo "module '$m' needs >= ${need_mem}Gi memory (allocatable) but workers total $(awk "BEGIN{printf \"%.1f\", $tot_ki/1024/1024}")Gi"
+                shortfalls=1
+            fi
+        fi
+    fi
+    [ "$shortfalls" -eq 0 ]
 }
 
 # Build-mode module preflight (mode=build) collects ALL errors and aborts before any
@@ -549,33 +590,43 @@ run_module_phase() {
     done
 }
 
-# Per-cluster state: which modules are installed, one name per line, in the install
-# dir so --remove and teardown know what to clean up.
+# Per-cluster state, in the install dir so --remove and teardown know what to clean up.
+# One line per module, "<name> <status>" with status attempted|installed|failed. INTENT
+# is recorded (attempted) BEFORE a module's install/provision runs and the OUTCOME after,
+# so destroy always covers anything ATTEMPTED — a half-failed install is never orphaned.
 _state_file() { echo "${INSTALL_DIR}/modules.state"; }
-state_add_module() {
-    local f; f="$(_state_file)"
+# Upsert "<name> <status>", replacing any existing line for that module.
+state_set_module() {
+    local name="$1" status="$2" f; f="$(_state_file)"
     touch "$f"; chmod 600 "$f"
-    grep -qxF "$1" "$f" 2>/dev/null || echo "$1" >> "$f"
-}
-state_remove_module() {
-    local f; f="$(_state_file)"
-    [ -f "$f" ] || return 0
-    grep -vxF "$1" "$f" > "$f.tmp" 2>/dev/null || true
+    grep -v -E "^${name}([[:space:]]|$)" "$f" > "$f.tmp" 2>/dev/null || true
+    echo "$name $status" >> "$f.tmp"
     mv "$f.tmp" "$f"
 }
+state_remove_module() {
+    local name="$1" f; f="$(_state_file)"
+    [ -f "$f" ] || return 0
+    grep -v -E "^${name}([[:space:]]|$)" "$f" > "$f.tmp" 2>/dev/null || true
+    mv "$f.tmp" "$f"
+}
+# Names only (first field) — teardown/remove iterate names, covering anything attempted.
 state_list_modules() {
     local f; f="$(_state_file)"
-    [ -f "$f" ] && cat "$f" || true
+    [ -f "$f" ] || return 0
+    awk '{print $1}' "$f"
 }
 
-# Print the correct teardown sequence. If modules are installed they must be removed
-# FIRST (their destroy hooks clean up cluster-external AWS resources that
-# `openshift-install destroy` will not touch), THEN the cluster is destroyed.
+# Print the teardown command. `--teardown` is the primary, ENFORCED path: it runs every
+# installed module's destroy hook (reverse dependency order) and only then destroys the
+# cluster — so cluster-external AWS resources (S3/IAM) `openshift-install destroy` will not
+# touch are cleaned up first. The two-step manual sequence is a fallback for tearing down
+# by hand; skipping the module destroy there orphans AWS resources.
 print_teardown_hint() {
     local installed; installed="$(state_list_modules | tr '\n' ' ')"; installed="${installed% }"
+    echo "  $0 --teardown --dir $INSTALL_DIR"
     if [ -n "$installed" ]; then
-        echo "  # This cluster has modules installed: $installed"
-        echo "  # Remove them first (runs destroy hooks, incl. AWS cleanup):"
+        echo "  # (installed modules: $installed)"
+        echo "  # Manual fallback — modules FIRST, then the cluster:"
         echo "  $0 --remove ${installed// /,} --dir $INSTALL_DIR"
         local m
         for m in $installed; do
@@ -583,9 +634,8 @@ print_teardown_hint() {
             declare -F "${m}_destroy" >/dev/null 2>&1 || \
                 echo "  #   note: module '$m' has no destroy hook (may orphan resources)"
         done
-        echo "  # Then destroy the cluster:"
+        echo "  $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"
     fi
-    echo "  $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"
 }
 
 # Report module failures at the very end (continue-on-failure). Returns 1 if any.
@@ -606,6 +656,8 @@ list_modules() {
         floor=""
         [ -n "${MOD_MIN_WORKERS[$name]}" ]     && floor+="workers>=${MOD_MIN_WORKERS[$name]} "
         [ -n "${MOD_MIN_WORKER_TYPE[$name]}" ] && floor+="type>=${MOD_MIN_WORKER_TYPE[$name]} "
+        [ -n "${MOD_MIN_CPU[$name]}" ]         && floor+="cpu>=${MOD_MIN_CPU[$name]} "
+        [ -n "${MOD_MIN_MEMORY[$name]}" ]      && floor+="mem>=${MOD_MIN_MEMORY[$name]}Gi "
         [ -n "${MOD_REQUIRES[$name]}" ]        && floor+="requires:${MOD_REQUIRES[$name]// /,} "
         [ "${MOD_CREATES_AWS[$name]}" = "true" ] && floor+="(creates AWS resources) "
         printf '  %-16s %s\n' "$name" "${MOD_DESCRIPTION[$name]}"
@@ -631,12 +683,15 @@ require_target_dir() {
 run_add_mode() {
     require_target_dir
     run_module_preflight add "${RESOLVED_ORDER[@]}"
+    local m
+    # Intent before install, outcome after — same contract as the build path.
+    for m in "${RESOLVED_ORDER[@]}"; do state_set_module "$m" attempted; done
     run_module_phase install "${RESOLVED_ORDER[@]}"
     run_module_phase wait    "${RESOLVED_ORDER[@]}"
     run_module_phase verify  "${RESOLVED_ORDER[@]}"
-    local m
     for m in "${RESOLVED_ORDER[@]}"; do
-        [ -n "${MOD_FAILED[$m]:-}" ] || state_add_module "$m"
+        if [ -n "${MOD_FAILED[$m]:-}" ]; then state_set_module "$m" failed
+        else state_set_module "$m" installed; fi
     done
     report_module_failures || die "one or more modules failed (see summary above)"
     log "Add complete."
@@ -658,6 +713,53 @@ run_remove_mode() {
     done
     report_module_failures || die "one or more modules failed to destroy (see summary above)"
     log "Remove complete."
+}
+
+# --teardown: the ENFORCED teardown path. Run every installed module's destroy hook
+# (reverse dependency order) and ONLY THEN destroy the cluster. If any destroy hook fails,
+# abort WITHOUT destroying the cluster — an orphaned S3 bucket with no cluster left to
+# trace it back to is worse than a failed teardown you can re-run. The module set comes
+# from modules.state, not flags.
+run_teardown_mode() {
+    require_target_dir
+    local installed=()
+    mapfile -t installed < <(state_list_modules)
+    if [ "${#installed[@]}" -gt 0 ]; then
+        log "Tearing down modules before the cluster: ${installed[*]}"
+        # A module recorded in state but missing on disk cannot be safely destroyed; stop
+        # rather than risk orphaning whatever it created.
+        local m
+        for m in "${installed[@]}"; do
+            [ -f "$MODULES_DIR/$m/module.sh" ] || \
+                die "module '$m' is in state but not found in $MODULES_DIR; restore it or clean up manually before teardown"
+        done
+        resolve_dependencies "${installed[@]}"
+        local i
+        for (( i=${#RESOLVED_ORDER[@]}-1; i>=0; i-- )); do
+            m="${RESOLVED_ORDER[$i]}"
+            if declare -F "${m}_destroy" >/dev/null; then
+                run_module_phase destroy "$m"
+                [ -n "${MOD_FAILED[$m]:-}" ] || state_remove_module "$m"
+            elif [ "${MOD_CREATES_AWS[$m]}" = "true" ]; then
+                # No destroy hook but declares AWS resources: we cannot clean them, and the
+                # cluster destroy will not either. Treat as a failure so we do NOT proceed.
+                MOD_FAILED[$m]=1
+                MODULE_FAILURES+=("$m (no destroy hook, declares AWS resources)")
+                warn "module '$m' has no destroy hook but declares AWS resources; cannot clean up"
+            else
+                warn "module '$m' has no destroy hook; the cluster destroy will reclaim its in-cluster resources"
+                state_remove_module "$m"
+            fi
+        done
+        # ENFORCEMENT: any destroy failure blocks the cluster destroy.
+        report_module_failures || \
+            die "module teardown failed; NOT destroying the cluster (an orphaned AWS resource with no cluster is harder to trace). Fix the above and re-run --teardown."
+    else
+        log "No modules recorded in state; proceeding straight to cluster destroy."
+    fi
+    log "All module destroy hooks succeeded; destroying the cluster..."
+    "$OPENSHIFT_INSTALL" destroy cluster --dir="$INSTALL_DIR"
+    log "Cluster destroyed. (The install dir $INSTALL_DIR is left in place; remove it manually if you no longer need its logs.)"
 }
 
 # --- ERR trap: never leave a half-built cluster running silently --------------
@@ -767,9 +869,11 @@ if [ -n "$LIST_MODULES" ]; then
 fi
 
 # In --add / --remove the target set comes from that flag, not --with / MODULES.
+# --teardown takes its set from modules.state (resolved inside run_teardown_mode).
 case "$MODE" in
     add)    ENABLED_MODULES=(); _add_enabled "$ADD_MODULES" ;;
     remove) ENABLED_MODULES=(); _add_enabled "$REMOVE_MODULES" ;;
+    teardown) ENABLED_MODULES=() ;;
 esac
 
 # Resolve dependencies (transitive, cycle-checked) into RESOLVED_ORDER.
@@ -777,10 +881,11 @@ if [ "${#ENABLED_MODULES[@]}" -gt 0 ]; then
     resolve_dependencies "${ENABLED_MODULES[@]}"
 fi
 
-# --add / --remove operate on an existing cluster: no build, no build preflight.
+# --add / --remove / --teardown operate on an existing cluster: no build, no build preflight.
 case "$MODE" in
-    add)    run_add_mode;    exit 0 ;;
-    remove) run_remove_mode; exit 0 ;;
+    add)      run_add_mode;      exit 0 ;;
+    remove)   run_remove_mode;   exit 0 ;;
+    teardown) run_teardown_mode; exit 0 ;;
 esac
 
 # Build mode: sizing must be resolved BEFORE install-config.yaml is rendered, so a
@@ -881,6 +986,9 @@ echo "Backed up rendered install-config to $RENDERED.bak (installer consumes the
 # Runs before `create cluster` so a module can stand up S3/IAM the installer needs.
 # No module uses this yet; the plumbing is built and dispatched.
 if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
+    # Record INTENT before the first creation step (provision creates AWS resources
+    # before the cluster even exists), so teardown/destroy covers anything attempted.
+    for m in "${RESOLVED_ORDER[@]}"; do state_set_module "$m" attempted; done
     run_module_phase provision "${RESOLVED_ORDER[@]}"
 fi
 
@@ -1052,8 +1160,11 @@ if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
     run_module_phase install "${RESOLVED_ORDER[@]}"
     run_module_phase wait    "${RESOLVED_ORDER[@]}"
     run_module_phase verify  "${RESOLVED_ORDER[@]}"
+    # Record OUTCOME. Both installed and failed stay in state so destroy still covers
+    # a half-failed module (its install may have created resources).
     for m in "${RESOLVED_ORDER[@]}"; do
-        [ -n "${MOD_FAILED[$m]:-}" ] || state_add_module "$m"
+        if [ -n "${MOD_FAILED[$m]:-}" ]; then state_set_module "$m" failed
+        else state_set_module "$m" installed; fi
     done
 fi
 

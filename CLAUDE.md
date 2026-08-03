@@ -116,9 +116,15 @@ module. **Namespace every hook and internal variable with the module name.**
 |---|---|
 | `MODULE_DESCRIPTION` | human text for `--list-modules` (**required**) |
 | `MODULE_REQUIRES` | space-separated module names that must also be enabled |
-| `MODULE_MIN_WORKERS` | worker-count floor; empty = no requirement |
-| `MODULE_MIN_WORKER_TYPE` | worker instance-type floor; empty = no requirement |
+| `MODULE_MIN_WORKERS` | worker-count floor for **build-time provisioning**; empty = none |
+| `MODULE_MIN_WORKER_TYPE` | worker instance-type floor for **build-time provisioning**; empty = none |
+| `MODULE_MIN_CPU` | aggregate **allocatable** CPU (cores) the module needs to schedule; the `--add` gate |
+| `MODULE_MIN_MEMORY` | aggregate **allocatable** memory (GiB) the module needs to schedule; the `--add` gate |
 | `MODULE_CREATES_AWS` | `true`/`false`: creates cluster-external AWS resources |
+
+`MIN_WORKERS`/`MIN_WORKER_TYPE` shape the node pool a **fresh build** provisions (nominal).
+`MIN_CPU`/`MIN_MEMORY` express what the workload actually needs to **schedule** and drive
+the `--add` capacity gate against a live cluster — keep the two concerns separate.
 
 Hooks (all optional **except `install`**; a missing hook is skipped for that phase):
 
@@ -144,15 +150,24 @@ hard error, never a guess.
 - `--list-modules` — print modules with descriptions + floors, exit.
 - `--add <a,b> --dir <path>` — install modules into an **existing** cluster. Skips
   cluster/cert/gitops entirely; sets `KUBECONFIG` from `<dir>/auth/kubeconfig`. Sizing
-  **cannot** be applied to a live cluster, so add-mode preflight compares each floor
-  against the **live node capacity** and **hard-fails** naming the module and shortfall
-  rather than leaving pods Pending.
+  **cannot** be applied to a live cluster, so add-mode preflight compares each module's
+  `MIN_CPU`/`MIN_MEMORY` against the **summed allocatable CPU/memory of the worker
+  nodes** (`check_live_capacity`) — **not node count**, which would wave a MultiClusterHub
+  onto one m6i.xlarge it can't schedule on — and **hard-fails** naming the module and
+  shortfall rather than leaving pods Pending.
 - `--remove <a,b> --dir <path>` — run `destroy` hooks (reverse dependency order) against
   an existing cluster. A module lacking a destroy hook is logged (possible orphans).
-- `--dir` is required by `--add`/`--remove`; a missing dir or kubeconfig fails clearly.
+- `--teardown --dir <path>` — the **enforced** teardown (see below).
+- `--dir` is required by `--add`/`--remove`/`--teardown`; a missing dir or kubeconfig
+  fails clearly.
 
-Installed modules are recorded in `<install-dir>/modules.state` so `--remove` and
-teardown know what to clean up.
+Installed modules are recorded in `<install-dir>/modules.state`, one line per module
+`<name> <status>` where status is `attempted` | `installed` | `failed`. **Intent
+(`attempted`) is written BEFORE a module's provision/install runs and the outcome after**,
+so `--remove`/`--teardown` clean up anything *attempted* — a half-failed install (its
+Subscription applied but the CSV never went ready) is never silently orphaned. Because a
+module may be torn down after only partially installing, **`destroy` hooks must be
+idempotent** (use `--ignore-not-found`).
 
 ### Failure semantics (chosen)
 
@@ -168,10 +183,18 @@ teardown know what to clean up.
 
 ### Teardown
 
-`openshift-install destroy cluster` does **not** remove a module's S3/IAM. The ERR-trap
-and success-banner destroy hints are module-aware: if `modules.state` is non-empty they
-tell you to `--remove` the installed modules **first** (runs destroy hooks), **then**
-destroy the cluster, and name any installed module that has no destroy hook.
+`openshift-install destroy cluster` does **not** remove a module's S3/IAM, so tearing a
+cluster down with a bare `openshift-install destroy` orphans (and keeps billing) whatever
+a module provisioned. **`--teardown --dir <path>` is the enforced path**: it reads
+`modules.state`, runs every recorded module's `destroy` hook in **reverse dependency
+order**, and **only if all succeed** invokes `openshift-install destroy cluster`. If any
+destroy hook fails — or a module declares `MODULE_CREATES_AWS=true` but has no destroy
+hook — teardown **aborts without destroying the cluster** (an orphaned bucket with no
+cluster left to trace it is worse than a re-runnable failed teardown). A module with no
+destroy hook and `CREATES_AWS=false` is skipped with a warning (the cluster destroy
+reclaims its in-cluster objects). The ERR-trap/success-banner hints lead with `--teardown`
+and keep the two-step manual `--remove` → `openshift-install destroy` sequence as a
+fallback.
 
 ### How to write a module
 
@@ -182,9 +205,13 @@ destroy the cluster, and name any installed module that has no destroy hook.
 3. Use the shared `log/warn/die` helpers and the idempotent
    `oc create … --dry-run=client -o yaml | oc apply -f -` pattern; `wait_for_object`
    is available for "wait until it exists".
-4. Give `verify` a real assertion (read something back), and `destroy` must undo both
-   `install` and `provision` (including AWS resources).
-5. Add smoke coverage in `test/smoke.sh` using scratch module fixtures via `MODULES_DIR`
+4. Give `verify` a real assertion (read something back). `destroy` must undo both
+   `install` and `provision` (including AWS resources) and be **idempotent** — it may run
+   against a module that only partially installed.
+5. If the workload needs real capacity to schedule, set `MODULE_MIN_CPU`/`MODULE_MIN_MEMORY`
+   (aggregate allocatable) so `--add` refuses an undersized cluster; set
+   `MODULE_MIN_WORKERS`/`MODULE_MIN_WORKER_TYPE` to shape the pool a fresh build provisions.
+6. Add smoke coverage in `test/smoke.sh` using scratch module fixtures via `MODULES_DIR`
    and the stub `oc` — never touch a real cluster.
 
 ## HARD RULE — never touch a real cluster or AWS
@@ -221,9 +248,14 @@ returns it on `get` — so a module `verify` genuinely round-trips) to assert: d
 detection; sizing (max floor wins, a larger user topology is not scaled down, an
 unknown instance type fails); `--list-modules`; `--add`/`--remove` require `--dir`;
 **phase ordering** (all preflights before any install, across modules); and `--dry-run`
-with modules still renders a valid install-config. When adding an `oc`-piped call to the
-stub path, remember the stub drains `-f -` stdin so `oc create … | oc apply -f -` can't
-SIGPIPE.
+with modules still renders a valid install-config. It also covers the hardening: the
+**`--add` capacity gate** rejects a single undersized node by summed allocatable (the `oc`
+stub simulates node allocatable via `STUB_NODE_CPU`/`STUB_NODE_MEM`); **partial-failure
+state** (a module whose install fails is still recorded `failed` so destroy covers it);
+and **`--teardown`** (destroy hooks run before the cluster destroy; a failing destroy hook
+blocks the cluster destroy; `--teardown` needs `--dir`). When adding an `oc`-piped call to
+the stub path, remember the stub drains `-f -` stdin so `oc create … | oc apply -f -`
+can't SIGPIPE.
 
 ## Conventions
 
