@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: retroinvaders
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/neywa/retro-arcade-hub.git
+    targetRevision: HEAD
+    path: kubernetes/game-invaders
+  destination:
+    server: https://kubernetes.default.svc
+    # retro-invaders (not "invaders"): the Probe and PrometheusRules under
+    # kubernetes/game-invaders hardcode namespace: retro-invaders, so the whole
+    # app must land here or monitoring ends up in a different namespace than the
+    # workload.
+    namespace: retro-invaders
+  syncPolicy:
+    automated: {}
+    syncOptions:
+    - CreateNamespace=true
