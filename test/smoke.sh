@@ -706,6 +706,9 @@ echo "== Test 15: --add capacity check sums allocatable CPU/mem, not node count 
 mkdir -p "$MODS/cap/heavy"
 cat > "$MODS/cap/heavy/module.sh" <<'EOF'
 MODULE_DESCRIPTION="heavy module with an allocatable floor"
+# Build knobs consistent with the --add gate (1 × m6i.4xlarge = 15.5 CPU / 58Gi >= 8/32).
+MODULE_MIN_WORKERS="1"
+MODULE_MIN_WORKER_TYPE="m6i.4xlarge"
 MODULE_MIN_CPU="8"
 MODULE_MIN_MEMORY="32"
 MODULE_CREATES_AWS="false"
@@ -827,6 +830,111 @@ if [ "$rc19" -ne 0 ] && grep -q -- "--dir" <<<"$out19"; then
     pass "--teardown without --dir failed clearly"
 else
     echo "$out19"; fail "--teardown without --dir did not fail clearly"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 20: a provision hook (not the flag) forces the teardown hard-block =="
+# The module creates cluster-external state in provision but FORGETS CREATES_AWS and has
+# no destroy hook. The old flag-only check waved this through; deriving state from the
+# provision hook must hard-block teardown so its bucket is never orphaned.
+mkdir -p "$MODS/ext/tdforgot"
+cat > "$MODS/ext/tdforgot/module.sh" <<'EOF'
+MODULE_DESCRIPTION="creates external state in provision but forgot CREATES_AWS"
+MODULE_CREATES_AWS="false"
+tdforgot_provision() { :; }   # defined -> implies cluster-external state
+tdforgot_install()   { :; }
+# no destroy hook on purpose
+EOF
+CL20="$SCRATCH/cluster20"; mk_cluster_dir "$CL20" "tdforgot installed"
+set +e
+out20="$(run_ocp run20 MODULES_DIR="$MODS/ext" -- --teardown --dir "$CL20" 2>&1)"
+rc20=$?
+set -e
+if [ "$rc20" -ne 0 ] && ! grep -q "STUB openshift-install: destroy cluster" <<<"$out20" \
+   && grep -qi "NOT destroying the cluster" <<<"$out20"; then
+    pass "provision-hook module with no destroy hook blocked the cluster destroy"
+else
+    echo "$out20"; fail "provision-hook module did not block the cluster destroy"
+fi
+if [ -f "$CL20/modules.state" ] && grep -q "tdforgot" "$CL20/modules.state"; then
+    pass "blocked module left in state"
+else
+    fail "blocked module was wrongly cleared from state"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 21: load-time warning when provision hook and CREATES_AWS disagree =="
+# (tdforgot above has a provision hook but CREATES_AWS=false.)
+out21="$(run_ocp run21 MODULES_DIR="$MODS/ext" -- --list-modules 2>&1)"
+if grep -q "tdforgot" <<<"$out21" && grep -qi "provision hook but MODULE_CREATES_AWS is not true" <<<"$out21"; then
+    pass "load warned about the provision/CREATES_AWS mismatch, naming the module"
+else
+    echo "$out21"; fail "no load-time warning for the provision/CREATES_AWS mismatch"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 22: inconsistent sizing knobs are rejected at load =="
+# Build (1 × m6i.xlarge = 3.5 CPU) cannot satisfy the module's own --add gate (8 CPU).
+mkdir -p "$MODS/sz/badsize"
+cat > "$MODS/sz/badsize/module.sh" <<'EOF'
+MODULE_DESCRIPTION="knobs disagree: build too small for its own --add gate"
+MODULE_MIN_WORKERS="1"
+MODULE_MIN_WORKER_TYPE="m6i.xlarge"
+MODULE_MIN_CPU="8"
+MODULE_CREATES_AWS="false"
+badsize_install() { :; }
+EOF
+set +e
+out22="$(run_ocp run22 MODULES_DIR="$MODS/sz" -- -d smoke.example.com --with badsize --dry-run 2>&1)"
+rc22=$?
+set -e
+if [ "$rc22" -ne 0 ] && grep -q "sizing is inconsistent" <<<"$out22" \
+   && grep -q "badsize" <<<"$out22" && grep -q "MODULE_MIN_CPU=8" <<<"$out22"; then
+    pass "inconsistent knobs rejected at load, naming module + both figures"
+else
+    echo "$out22"; fail "inconsistent knobs were not rejected at load"
+fi
+# A --add gate with no build knobs at all is also rejected.
+mkdir -p "$MODS/sz/nobuild"
+cat > "$MODS/sz/nobuild/module.sh" <<'EOF'
+MODULE_DESCRIPTION="declares a gate but no build knobs to back it"
+MODULE_MIN_CPU="8"
+MODULE_CREATES_AWS="false"
+nobuild_install() { :; }
+EOF
+set +e
+out22b="$(run_ocp run22b MODULES_DIR="$MODS/sz" -- -d smoke.example.com --with nobuild --dry-run 2>&1)"
+rc22b=$?
+set -e
+if [ "$rc22b" -ne 0 ] && grep -q "not MODULE_MIN_WORKERS" <<<"$out22b"; then
+    pass "a --add gate without build knobs is rejected at load"
+else
+    echo "$out22b"; fail "a gate without build knobs was not rejected"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 23: consistent sizing knobs load and render =="
+# Build (3 × m6i.2xlarge = 22.5 CPU / 86Gi) covers the gate (16 CPU / 48Gi).
+mkdir -p "$MODS/sz/goodsize"
+cat > "$MODS/sz/goodsize/module.sh" <<'EOF'
+MODULE_DESCRIPTION="knobs agree"
+MODULE_MIN_WORKERS="3"
+MODULE_MIN_WORKER_TYPE="m6i.2xlarge"
+MODULE_MIN_CPU="16"
+MODULE_MIN_MEMORY="48"
+MODULE_CREATES_AWS="false"
+goodsize_install() { :; }
+EOF
+run_ocp run23 MODULES_DIR="$MODS/sz" -- -d smoke.example.com --with goodsize --dry-run >/dev/null 2>&1
+R23="$(find "$SCRATCH/run23" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
+if [ -n "$R23" ] && python3 -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); sys.exit(0 if isinstance(d,dict) else 1)' "$R23"; then
+    pass "consistent module loaded and the build rendered a valid install-config"
+else
+    fail "consistent module failed to load/render"
 fi
 
 # =============================================================================

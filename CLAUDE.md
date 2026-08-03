@@ -124,7 +124,13 @@ module. **Namespace every hook and internal variable with the module name.**
 
 `MIN_WORKERS`/`MIN_WORKER_TYPE` shape the node pool a **fresh build** provisions (nominal).
 `MIN_CPU`/`MIN_MEMORY` express what the workload actually needs to **schedule** and drive
-the `--add` capacity gate against a live cluster — keep the two concerns separate.
+the `--add` capacity gate against a live cluster — keep the two concerns separate but
+**consistent**: `load_module` cross-checks them against a realistic-allocatable table
+(`WORKER_TYPE_ALLOC_CPU`/`_MEM`, deliberately below AWS-nominal to model kube/system-
+reserved + eviction) and **fails** if `MIN_WORKERS × alloc(MIN_WORKER_TYPE)` cannot meet
+`MIN_CPU`/`MIN_MEMORY` — otherwise a build could stand up a cluster its own `--add` gate
+rejects. (Those figures feed only the static assertion; the runtime gate reads the
+cluster's real allocatable.)
 
 Hooks (all optional **except `install`**; a missing hook is skipped for that phase):
 
@@ -134,6 +140,12 @@ Hooks (all optional **except `install`**; a missing hook is skipped for that pha
 - `wait` — block until the module's workloads are actually ready.
 - `verify` — assert the module works (**meaningful**, not just "pods Running").
 - `destroy` — remove what install + provision created, including AWS resources.
+
+**A `provision` hook is authoritative evidence of cluster-external state** — the phase is
+defined as creating it. Teardown derives "has external state" from *the hook or*
+`CREATES_AWS` (`_module_has_external_state`), so a module that provisions a bucket but
+forgets the flag still can't slip past the hard-block. `load_module` **warns** when a
+`provision` hook and `CREATES_AWS` disagree; declare them together.
 
 **Dependencies** are expanded transitively with cycle detection and a deterministic
 order (dependencies before dependents); the resolved set is logged when it differs from
@@ -188,11 +200,11 @@ cluster down with a bare `openshift-install destroy` orphans (and keeps billing)
 a module provisioned. **`--teardown --dir <path>` is the enforced path**: it reads
 `modules.state`, runs every recorded module's `destroy` hook in **reverse dependency
 order**, and **only if all succeed** invokes `openshift-install destroy cluster`. If any
-destroy hook fails — or a module declares `MODULE_CREATES_AWS=true` but has no destroy
-hook — teardown **aborts without destroying the cluster** (an orphaned bucket with no
-cluster left to trace it is worse than a re-runnable failed teardown). A module with no
-destroy hook and `CREATES_AWS=false` is skipped with a warning (the cluster destroy
-reclaims its in-cluster objects). The ERR-trap/success-banner hints lead with `--teardown`
+destroy hook fails — or a module has cluster-external state (a `provision` hook **or**
+`CREATES_AWS=true`) but no destroy hook — teardown **aborts without destroying the
+cluster** (an orphaned bucket with no cluster left to trace it is worse than a re-runnable
+failed teardown). A module with no destroy hook and no external state is skipped with a
+warning (the cluster destroy reclaims its in-cluster objects). The ERR-trap/success-banner hints lead with `--teardown`
 and keep the two-step manual `--remove` → `openshift-install destroy` sequence as a
 fallback.
 
@@ -207,10 +219,12 @@ fallback.
    is available for "wait until it exists".
 4. Give `verify` a real assertion (read something back). `destroy` must undo both
    `install` and `provision` (including AWS resources) and be **idempotent** — it may run
-   against a module that only partially installed.
+   against a module that only partially installed. If it creates cluster-external state,
+   do so in `provision` and set `MODULE_CREATES_AWS=true` (both, or load warns).
 5. If the workload needs real capacity to schedule, set `MODULE_MIN_CPU`/`MODULE_MIN_MEMORY`
-   (aggregate allocatable) so `--add` refuses an undersized cluster; set
-   `MODULE_MIN_WORKERS`/`MODULE_MIN_WORKER_TYPE` to shape the pool a fresh build provisions.
+   (aggregate allocatable) so `--add` refuses an undersized cluster, **and** set
+   `MODULE_MIN_WORKERS`/`MODULE_MIN_WORKER_TYPE` large enough to back them — load fails if
+   the build pool can't meet the module's own gate.
 6. Add smoke coverage in `test/smoke.sh` using scratch module fixtures via `MODULES_DIR`
    and the stub `oc` — never touch a real cluster.
 
@@ -253,7 +267,11 @@ with modules still renders a valid install-config. It also covers the hardening:
 stub simulates node allocatable via `STUB_NODE_CPU`/`STUB_NODE_MEM`); **partial-failure
 state** (a module whose install fails is still recorded `failed` so destroy covers it);
 and **`--teardown`** (destroy hooks run before the cluster destroy; a failing destroy hook
-blocks the cluster destroy; `--teardown` needs `--dir`). When adding an `oc`-piped call to
+blocks the cluster destroy; `--teardown` needs `--dir`); plus the consistency checks — a
+**provision hook with no destroy hook** hard-blocks teardown even when `CREATES_AWS` is
+unset, a **provision/`CREATES_AWS` mismatch** warns at load, and **inconsistent sizing
+knobs** (`MIN_WORKERS × MIN_WORKER_TYPE` below the module's own `MIN_CPU`/`MIN_MEMORY`
+gate) are rejected at load while consistent ones render. When adding an `oc`-piped call to
 the stub path, remember the stub drains `-f -` stdin so `oc create … | oc apply -f -`
 can't SIGPIPE.
 

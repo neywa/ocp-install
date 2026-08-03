@@ -359,6 +359,39 @@ declare -A WORKER_TYPE_RANK=(
     [m5.8xlarge]=5  [m5.12xlarge]=6  [m5.16xlarge]=7  [m5.24xlarge]=8
 )
 
+# Realistic per-worker ALLOCATABLE CPU (millicores) and memory (MiB). This is
+# AWS-nominal MINUS what OCP reserves on a worker (kube-reserved + system-reserved,
+# which auto node-sizing scales with the node, plus the ~100Mi hard-eviction
+# threshold) — NOT the raw AWS spec. Using nominal here would let a topology pass the
+# static consistency assertion below and then fail to schedule the workload. Figures
+# are approximate/conservative, observed on OCP 4.x AWS workers; refine one from a live
+# node with `oc get node <n> -o jsonpath='{.status.allocatable}'`. NOTE: these estimates
+# feed only the load-time assertion; the runtime --add gate reads the cluster's REAL
+# allocatable (see check_live_capacity).
+declare -A WORKER_TYPE_ALLOC_CPU=(   # millicores  (nominal vCPU: large2 xl4 2xl8 4xl16 8xl32 12xl48 16xl64 24xl96)
+    [m6i.large]=1500  [m6i.xlarge]=3500  [m6i.2xlarge]=7500  [m6i.4xlarge]=15500
+    [m6i.8xlarge]=31000 [m6i.12xlarge]=47000 [m6i.16xlarge]=63000 [m6i.24xlarge]=95000
+    [m5.large]=1500   [m5.xlarge]=3500   [m5.2xlarge]=7500   [m5.4xlarge]=15500
+    [m5.8xlarge]=31000  [m5.12xlarge]=47000  [m5.16xlarge]=63000  [m5.24xlarge]=95000
+)
+declare -A WORKER_TYPE_ALLOC_MEM=(   # MiB  (nominal GiB: large8 xl16 2xl32 4xl64 8xl128 12xl192 16xl256 24xl384)
+    [m6i.large]=6000   [m6i.xlarge]=14500  [m6i.2xlarge]=29500  [m6i.4xlarge]=60000
+    [m6i.8xlarge]=121000 [m6i.12xlarge]=182000 [m6i.16xlarge]=243000 [m6i.24xlarge]=366000
+    [m5.large]=6000    [m5.xlarge]=14500   [m5.2xlarge]=29500   [m5.4xlarge]=60000
+    [m5.8xlarge]=121000  [m5.12xlarge]=182000  [m5.16xlarge]=243000  [m5.24xlarge]=366000
+)
+
+# A module has cluster-external state if it defines a provision hook (that phase is
+# DEFINED as "create cluster-external resources") OR declares MODULE_CREATES_AWS=true.
+# Deriving from the hook is stronger than trusting the flag — a module that creates a
+# bucket in provision but forgets the flag must still block teardown.
+_module_has_external_state() {
+    local m="$1"
+    declare -F "${m}_provision" >/dev/null && return 0
+    [ "${MOD_CREATES_AWS[$m]:-false}" = "true" ] && return 0
+    return 1
+}
+
 # List discoverable module names (basename of each modules/<name>/module.sh).
 discover_modules() {
     [ -d "$MODULES_DIR" ] || return 0
@@ -367,6 +400,32 @@ discover_modules() {
         [ -f "$f" ] || continue
         basename "$(dirname "$f")"
     done
+}
+
+# Assert a module's build-time knobs (MIN_WORKERS × MIN_WORKER_TYPE) can satisfy its own
+# --add capacity gate (MIN_CPU / MIN_MEMORY) — else the build would create a cluster the
+# module's own --add gate would reject. Uses the realistic-allocatable tables above.
+_assert_module_sizing_consistent() {
+    local m="$1"
+    local need_cpu="${MOD_MIN_CPU[$m]:-}" need_mem="${MOD_MIN_MEMORY[$m]:-}"
+    [ -n "$need_cpu$need_mem" ] || return 0
+    local mw="${MOD_MIN_WORKERS[$m]:-}" mt="${MOD_MIN_WORKER_TYPE[$m]:-}"
+    { [ -n "$mw" ] && [ -n "$mt" ]; } || \
+        die "module '$m' sets MODULE_MIN_CPU/MODULE_MIN_MEMORY (the --add gate) but not MODULE_MIN_WORKERS + MODULE_MIN_WORKER_TYPE; the build cannot guarantee the capacity its own --add gate requires"
+    [ -n "${WORKER_TYPE_ALLOC_CPU[$mt]:-}" ] || \
+        die "module '$m' MODULE_MIN_WORKER_TYPE '$mt' has no allocatable entry in WORKER_TYPE_ALLOC_CPU/MEM; add it"
+    local prov_cpu_m=$(( mw * WORKER_TYPE_ALLOC_CPU[$mt] ))
+    local prov_mem_mib=$(( mw * WORKER_TYPE_ALLOC_MEM[$mt] ))
+    if [ -n "$need_cpu" ]; then
+        local req_m; req_m="$(awk "BEGIN{printf \"%d\", $need_cpu*1000}")"
+        [ "$prov_cpu_m" -ge "$req_m" ] || \
+            die "module '$m' sizing is inconsistent: build provisions ${mw} × ${mt} = $(awk "BEGIN{printf \"%.1f\", $prov_cpu_m/1000}") allocatable CPU, but MODULE_MIN_CPU=${need_cpu} — the build would create a cluster its own --add gate rejects"
+    fi
+    if [ -n "$need_mem" ]; then
+        local req_mib; req_mib="$(awk "BEGIN{printf \"%d\", $need_mem*1024}")"
+        [ "$prov_mem_mib" -ge "$req_mib" ] || \
+            die "module '$m' sizing is inconsistent: build provisions ${mw} × ${mt} = $(awk "BEGIN{printf \"%.1f\", $prov_mem_mib/1024}")Gi allocatable memory, but MODULE_MIN_MEMORY=${need_mem}Gi — the build would create a cluster its own --add gate rejects"
+    fi
 }
 
 # Source a module once and snapshot its metadata. Fails clearly on a malformed
@@ -390,6 +449,16 @@ load_module() {
     MOD_MIN_CPU[$name]="${MODULE_MIN_CPU:-}"
     MOD_MIN_MEMORY[$name]="${MODULE_MIN_MEMORY:-}"
     MOD_CREATES_AWS[$name]="${MODULE_CREATES_AWS:-false}"
+    # Consistency: a provision hook and MODULE_CREATES_AWS should agree — provision is
+    # DEFINED as creating cluster-external state, so declaring one without the other is a
+    # latent bug (teardown keys on both; see _module_has_external_state). Warn, don't fail.
+    if declare -F "${name}_provision" >/dev/null && [ "${MOD_CREATES_AWS[$name]}" != "true" ]; then
+        warn "module '$name' defines a provision hook but MODULE_CREATES_AWS is not true; provision creates cluster-external state — set MODULE_CREATES_AWS=true"
+    elif ! declare -F "${name}_provision" >/dev/null && [ "${MOD_CREATES_AWS[$name]}" = "true" ]; then
+        warn "module '$name' declares MODULE_CREATES_AWS=true but has no provision hook; cluster-external resources belong in the provision phase"
+    fi
+    # Cross-check the four sizing knobs before trusting the module (fails clearly).
+    _assert_module_sizing_consistent "$name"
     MOD_LOADED[$name]=1
     unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE \
           MODULE_MIN_CPU MODULE_MIN_MEMORY MODULE_CREATES_AWS
@@ -740,12 +809,13 @@ run_teardown_mode() {
             if declare -F "${m}_destroy" >/dev/null; then
                 run_module_phase destroy "$m"
                 [ -n "${MOD_FAILED[$m]:-}" ] || state_remove_module "$m"
-            elif [ "${MOD_CREATES_AWS[$m]}" = "true" ]; then
-                # No destroy hook but declares AWS resources: we cannot clean them, and the
-                # cluster destroy will not either. Treat as a failure so we do NOT proceed.
+            elif _module_has_external_state "$m"; then
+                # No destroy hook but has cluster-external state (provision hook or
+                # CREATES_AWS): we cannot clean it, and the cluster destroy will not
+                # either. Treat as a failure so we do NOT proceed to cluster destroy.
                 MOD_FAILED[$m]=1
-                MODULE_FAILURES+=("$m (no destroy hook, declares AWS resources)")
-                warn "module '$m' has no destroy hook but declares AWS resources; cannot clean up"
+                MODULE_FAILURES+=("$m (no destroy hook, has cluster-external state)")
+                warn "module '$m' has no destroy hook but has cluster-external state; cannot clean up"
             else
                 warn "module '$m' has no destroy hook; the cluster destroy will reclaim its in-cluster resources"
                 state_remove_module "$m"
