@@ -168,18 +168,23 @@ hard error, never a guess.
   onto one m6i.xlarge it can't schedule on — and **hard-fails** naming the module and
   shortfall rather than leaving pods Pending.
 - `--remove <a,b> --dir <path>` — run `destroy` hooks (reverse dependency order) against
-  an existing cluster. A module lacking a destroy hook is logged (possible orphans).
+  an existing cluster. A module with **cluster-external state but no destroy hook** is
+  **not dropped** from state — that would hide it from `--teardown`'s gate and orphan its
+  AWS resource when the cluster is later destroyed; it is flagged `orphaned` (see below)
+  and `--remove` exits non-zero. An in-cluster-only module with no destroy hook is dropped.
 - `--teardown --dir <path>` — the **enforced** teardown (see below).
 - `--dir` is required by `--add`/`--remove`/`--teardown`; a missing dir or kubeconfig
   fails clearly.
 
 Installed modules are recorded in `<install-dir>/modules.state`, one line per module
-`<name> <status>` where status is `attempted` | `installed` | `failed`. **Intent
-(`attempted`) is written BEFORE a module's provision/install runs and the outcome after**,
-so `--remove`/`--teardown` clean up anything *attempted* — a half-failed install (its
-Subscription applied but the CSV never went ready) is never silently orphaned. Because a
-module may be torn down after only partially installing, **`destroy` hooks must be
-idempotent** (use `--ignore-not-found`).
+`<name> <status>` where status is `attempted` | `installed` | `failed` | `orphaned`.
+**Intent (`attempted`) is written BEFORE a module's provision/install runs and the outcome
+after**, so `--remove`/`--teardown` clean up anything *attempted* — a half-failed install
+(its Subscription applied but the CSV never went ready) is never silently orphaned. Because
+a module may be torn down after only partially installing, **`destroy` hooks must be
+idempotent** (use `--ignore-not-found`). `orphaned` marks a module `--remove` refused to
+drop (external state, no destroy hook); it **keeps blocking `--teardown`** until you delete
+what it created and remove its line from `modules.state` by hand.
 
 ### Failure semantics (chosen)
 
@@ -269,9 +274,11 @@ state** (a module whose install fails is still recorded `failed` so destroy cove
 and **`--teardown`** (destroy hooks run before the cluster destroy; a failing destroy hook
 blocks the cluster destroy; `--teardown` needs `--dir`); plus the consistency checks — a
 **provision hook with no destroy hook** hard-blocks teardown even when `CREATES_AWS` is
-unset, a **provision/`CREATES_AWS` mismatch** warns at load, and **inconsistent sizing
+unset, a **provision/`CREATES_AWS` mismatch** warns at load, **inconsistent sizing
 knobs** (`MIN_WORKERS × MIN_WORKER_TYPE` below the module's own `MIN_CPU`/`MIN_MEMORY`
-gate) are rejected at load while consistent ones render. When adding an `oc`-piped call to
+gate) are rejected at load while consistent ones render, and **`--remove` cannot bypass the
+teardown gate** (removing an external-state/no-destroy module flags it `orphaned` and a
+later `--teardown` still blocks). When adding an `oc`-piped call to
 the stub path, remember the stub drains `-f -` stdin so `oc create … | oc apply -f -`
 can't SIGPIPE.
 

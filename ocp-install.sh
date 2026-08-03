@@ -767,7 +767,9 @@ run_add_mode() {
 }
 
 # --remove: run destroy hooks in REVERSE dependency order (dependents before
-# dependencies). A module with no destroy hook is logged so orphaned resources are visible.
+# dependencies). A module with cluster-external state but no destroy hook is NOT dropped
+# from state — doing so would hide it from --teardown's gate and orphan its AWS resource
+# when the cluster is later destroyed; it is flagged 'orphaned' for manual cleanup instead.
 run_remove_mode() {
     require_target_dir
     local i m
@@ -775,12 +777,18 @@ run_remove_mode() {
         m="${RESOLVED_ORDER[$i]}"
         if declare -F "${m}_destroy" >/dev/null; then
             run_module_phase destroy "$m"
+        elif _module_has_external_state "$m"; then
+            # Keep it in state (as 'orphaned') so --teardown still blocks on it.
+            state_set_module "$m" orphaned
+            MOD_FAILED[$m]=1
+            MODULE_FAILURES+=("$m (external state, no destroy hook — kept in state as 'orphaned')")
+            warn "module '$m' has cluster-external state (provision hook or CREATES_AWS) but no destroy hook; NOT removing it. Manually delete what it created, then delete its '$m' line from ${INSTALL_DIR}/modules.state."
         else
-            warn "module '$m' has no destroy hook; nothing removed for it (possible orphaned resources)"
+            warn "module '$m' has no destroy hook; nothing to remove (in-cluster only)"
         fi
         [ -n "${MOD_FAILED[$m]:-}" ] || state_remove_module "$m"
     done
-    report_module_failures || die "one or more modules failed to destroy (see summary above)"
+    report_module_failures || die "one or more modules failed to remove (see summary above)"
     log "Remove complete."
 }
 

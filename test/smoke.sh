@@ -937,6 +937,48 @@ else
     fail "consistent module failed to load/render"
 fi
 
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 24: --remove cannot bypass the teardown gate (external state, no destroy) =="
+# A module with cluster-external state but no destroy hook must not be dropped from state
+# by --remove, or a later --teardown would never see it and would orphan its AWS resource.
+mkdir -p "$MODS/rm/remext"
+cat > "$MODS/rm/remext/module.sh" <<'EOF'
+MODULE_DESCRIPTION="external state, no destroy hook"
+MODULE_CREATES_AWS="true"
+remext_provision() { :; }   # provision + flag agree -> no load warning
+remext_install()   { :; }
+# no destroy hook on purpose
+EOF
+CL24="$SCRATCH/cluster24"; mk_cluster_dir "$CL24" "remext installed"
+# 1) --remove must refuse to drop it and flag it 'orphaned'.
+set +e
+out24="$(run_ocp run24 MODULES_DIR="$MODS/rm" -- --remove remext --dir "$CL24" 2>&1)"
+rc24=$?
+set -e
+if [ "$rc24" -ne 0 ] && grep -qi "NOT removing" <<<"$out24"; then
+    pass "--remove refused to drop the external-state module (non-zero, cleanup message)"
+else
+    echo "$out24"; fail "--remove did not refuse to drop the external-state module"
+fi
+if [ -f "$CL24/modules.state" ] && grep -qE "^remext orphaned$" "$CL24/modules.state"; then
+    pass "module kept in state as 'orphaned'"
+else
+    echo "--- state ---"; [ -f "$CL24/modules.state" ] && cat "$CL24/modules.state"
+    fail "module was not kept in state as 'orphaned'"
+fi
+# 2) A subsequent --teardown must still block on it.
+set +e
+out24t="$(run_ocp run24t MODULES_DIR="$MODS/rm" -- --teardown --dir "$CL24" 2>&1)"
+rc24t=$?
+set -e
+if [ "$rc24t" -ne 0 ] && ! grep -q "STUB openshift-install: destroy cluster" <<<"$out24t" \
+   && grep -qi "NOT destroying the cluster" <<<"$out24t"; then
+    pass "--teardown after --remove still blocks the cluster destroy (hole closed)"
+else
+    echo "$out24t"; fail "--teardown did not block after --remove"
+fi
+
 # =============================================================================
 echo
 if [ "$FAILS" -ne 0 ]; then
