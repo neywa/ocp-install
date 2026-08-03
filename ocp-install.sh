@@ -42,6 +42,13 @@ Files:
   -f, --config <file>               install-config template path
                                     (default: \$SCRIPT_DIR/install-config-template.yaml)
 
+Modules (optional products, see --list-modules):
+      --with <a,b,c>                Enable modules on a fresh build (repeatable + comma-separated)
+      --list-modules                List available modules with descriptions/floors and exit
+      --add <a,b>                   Install modules into an EXISTING cluster (needs --dir)
+      --remove <a,b>                Destroy modules in an EXISTING cluster (needs --dir)
+      --dir <path>                  Install dir to target for --add / --remove
+
 Behaviour:
       --dry-run                     Render install-config.yaml and exit (no cluster/AWS)
       --skip-certs                  Skip custom certificate generation/application
@@ -70,9 +77,21 @@ CLI_INSTALL_CONFIG_TEMPLATE=""
 DRY_RUN=""
 SKIP_CERTS=""
 SKIP_GITOPS=""
+# Module system holders. WITH_MODULES accumulates --with (repeatable + comma-
+# separated); ADD/REMOVE select the against-an-existing-cluster modes; MODE is the
+# derived operating mode.
+WITH_MODULES=""
+ADD_MODULES=""
+REMOVE_MODULES=""
+TARGET_DIR=""
+LIST_MODULES=""
+MODE="build"
 
 # Accept "--flag value", "--flag=value", and short "-f value" forms.
 die() { echo "Error: $*" >&2; exit 1; }
+# Info/warning helpers, shared with sourced modules so hook code stays uniform.
+log()  { echo "$*"; }
+warn() { echo "Warning: $*" >&2; }
 
 need_val() {
     # $1 = flag name, $2 = value (may be empty if the user gave none)
@@ -113,6 +132,19 @@ while [ $# -gt 0 ]; do
         -f|--config)
             [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
             CLI_INSTALL_CONFIG_TEMPLATE="$val" ;;
+        --with)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            WITH_MODULES="${WITH_MODULES:+$WITH_MODULES,}$val" ;;
+        --add)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            ADD_MODULES="${ADD_MODULES:+$ADD_MODULES,}$val"; MODE="add" ;;
+        --remove)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            REMOVE_MODULES="${REMOVE_MODULES:+$REMOVE_MODULES,}$val"; MODE="remove" ;;
+        --dir)
+            [ -n "$val" ] || { val="${2:-}"; shift; }; need_val "$arg" "$val"
+            TARGET_DIR="$val" ;;
+        --list-modules) LIST_MODULES=1 ;;
         --dry-run)     DRY_RUN=1 ;;
         --skip-certs)  SKIP_CERTS=1 ;;
         --skip-gitops) SKIP_GITOPS=1 ;;
@@ -154,6 +186,11 @@ fi
 # monitoring Role — never cluster-admin. Must match the destination namespace(s) of
 # the Argo CD Applications you deploy (see invaders-application.yaml). Space-separated.
 : "${ARGOCD_MANAGED_NAMESPACES:=retro-invaders}"
+# Module system: where modules live (env-overridable like LAB_ENV so the smoke test
+# can point at scratch fixtures) and the modules enabled by config. --with appends to
+# MODULES; resolution follows the usual defaults < lab.env < environment < flags.
+: "${MODULES_DIR:=$SCRIPT_DIR/modules}"
+: "${MODULES:=}"
 # BASE_DOMAIN has no default; it is required.
 : "${BASE_DOMAIN:=}"
 
@@ -294,6 +331,335 @@ grant_argocd_namespace() {
         --dry-run=client -o yaml | oc apply -f -
 }
 
+# =============================================================================
+# Module system
+# =============================================================================
+# Optional products (RHACS, RHACM, OADP, Logging, …) are modules under
+# modules/<name>/module.sh, sourced by this script. Dispatch is PHASE-MAJOR: the
+# main flow loops over phases and, within each, over the enabled modules. Metadata
+# globals a module sets at source time are snapshotted here into per-module arrays;
+# hooks are functions named <name>_<hook> so two modules never collide. See CLAUDE.md.
+
+declare -A MOD_DESCRIPTION MOD_REQUIRES MOD_MIN_WORKERS MOD_MIN_WORKER_TYPE MOD_CREATES_AWS MOD_LOADED MOD_FAILED
+RESOLVED_ORDER=()      # dependency-resolved, deterministic install order
+MODULE_FAILURES=()     # "<module> (<phase>)" entries for the end-of-run summary
+
+# Instance-type ranking. Instance types are NOT lexically ordered ("2xlarge" sorts
+# before "xlarge"), so a module's worker-type floor is compared through this explicit
+# table. Extend it as modules need bigger workers; a type absent here is a hard error
+# rather than a guess. Sizes are ranked by ordinal within a family; cross-family
+# comparison is by that ordinal, which is good enough for a floor check.
+declare -A WORKER_TYPE_RANK=(
+    [m6i.large]=1  [m6i.xlarge]=2  [m6i.2xlarge]=3  [m6i.4xlarge]=4
+    [m6i.8xlarge]=5 [m6i.12xlarge]=6 [m6i.16xlarge]=7 [m6i.24xlarge]=8
+    [m5.large]=1   [m5.xlarge]=2   [m5.2xlarge]=3   [m5.4xlarge]=4
+    [m5.8xlarge]=5  [m5.12xlarge]=6  [m5.16xlarge]=7  [m5.24xlarge]=8
+)
+
+# List discoverable module names (basename of each modules/<name>/module.sh).
+discover_modules() {
+    [ -d "$MODULES_DIR" ] || return 0
+    local f
+    for f in "$MODULES_DIR"/*/module.sh; do
+        [ -f "$f" ] || continue
+        basename "$(dirname "$f")"
+    done
+}
+
+# Source a module once and snapshot its metadata. Fails clearly on a malformed
+# module (missing description or install hook). Metadata globals are cleared before
+# and after the source so an omitted field can never inherit a previous module's value.
+load_module() {
+    local name="$1"
+    [ -n "${MOD_LOADED[$name]:-}" ] && return 0
+    local file="$MODULES_DIR/$name/module.sh"
+    [ -f "$file" ] || die "module '$name' not found (expected $file)"
+    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE MODULE_CREATES_AWS
+    # shellcheck disable=SC1090
+    source "$file"
+    [ -n "${MODULE_DESCRIPTION:-}" ] || die "module '$name' is malformed: MODULE_DESCRIPTION is not set"
+    declare -F "${name}_install" >/dev/null || die "module '$name' is malformed: no ${name}_install hook defined"
+    MOD_DESCRIPTION[$name]="$MODULE_DESCRIPTION"
+    MOD_REQUIRES[$name]="${MODULE_REQUIRES:-}"
+    MOD_MIN_WORKERS[$name]="${MODULE_MIN_WORKERS:-}"
+    MOD_MIN_WORKER_TYPE[$name]="${MODULE_MIN_WORKER_TYPE:-}"
+    MOD_CREATES_AWS[$name]="${MODULE_CREATES_AWS:-false}"
+    MOD_LOADED[$name]=1
+    unset MODULE_DESCRIPTION MODULE_REQUIRES MODULE_MIN_WORKERS MODULE_MIN_WORKER_TYPE MODULE_CREATES_AWS
+}
+
+# DFS with gray/black marking: expand REQUIRES transitively, detect cycles, and emit
+# a deterministic order (dependencies before dependents, sorted tie-break).
+declare -A _DEP_STATE
+_dep_visit() {
+    local name="$1" path="$2"
+    case "${_DEP_STATE[$name]:-}" in
+        2) return 0 ;;
+        1) die "module dependency cycle detected: ${path} -> ${name}" ;;
+    esac
+    load_module "$name"
+    _DEP_STATE[$name]=1
+    local req
+    for req in $(printf '%s\n' ${MOD_REQUIRES[$name]:-} | sort); do
+        [ -n "$req" ] || continue
+        _dep_visit "$req" "${path:+$path -> }${name}"
+    done
+    _DEP_STATE[$name]=2
+    RESOLVED_ORDER+=("$name")
+}
+
+resolve_dependencies() {
+    RESOLVED_ORDER=()
+    _DEP_STATE=()
+    local requested=("$@") m
+    for m in $(printf '%s\n' "$@" | sort -u); do
+        _dep_visit "$m" ""
+    done
+    # Announce when dependency expansion pulled in more than was asked for.
+    local req_sorted res_sorted
+    req_sorted="$(printf '%s\n' "${requested[@]}" | sort -u | tr '\n' ' ')"
+    res_sorted="$(printf '%s\n' "${RESOLVED_ORDER[@]}" | sort -u | tr '\n' ' ')"
+    if [ "$req_sorted" != "$res_sorted" ]; then
+        log "Modules: requested [${req_sorted% }] -> resolved with dependencies [${res_sorted% }]"
+    fi
+    log "Module install order: ${RESOLVED_ORDER[*]}"
+}
+
+# Raise the worker pool to the largest floor any enabled module needs. BUILD MODE
+# ONLY — on --add the cluster already exists and cannot be resized (see run_add_mode).
+# Never scales below what the user asked for; fails clearly on a type not in the table.
+resolve_sizing() {
+    local modules=("$@") m
+    [ -n "${WORKER_TYPE_RANK[$WORKER_TYPE]:-}" ] || \
+        die "worker instance type '$WORKER_TYPE' is not in WORKER_TYPE_RANK; add it to the ranking table"
+    local max_workers="$WORKER_REPLICAS" src_workers=""
+    local floor_type="" src_type=""
+    for m in "${modules[@]}"; do
+        local mw="${MOD_MIN_WORKERS[$m]:-}" mt="${MOD_MIN_WORKER_TYPE[$m]:-}"
+        if [ -n "$mw" ] && [ "$mw" -gt "$max_workers" ]; then
+            max_workers="$mw"; src_workers="$m"
+        fi
+        if [ -n "$mt" ]; then
+            [ -n "${WORKER_TYPE_RANK[$mt]:-}" ] || \
+                die "module '$m' requires worker type '$mt', which is not in WORKER_TYPE_RANK"
+            if [ -z "$floor_type" ] || [ "${WORKER_TYPE_RANK[$mt]}" -gt "${WORKER_TYPE_RANK[$floor_type]}" ]; then
+                floor_type="$mt"; src_type="$m"
+            fi
+        fi
+    done
+    if [ "$max_workers" -gt "$WORKER_REPLICAS" ]; then
+        log "SIZING: module '$src_workers' requires >= $max_workers workers; raising WORKER_REPLICAS $WORKER_REPLICAS -> $max_workers"
+        WORKER_REPLICAS="$max_workers"
+    fi
+    if [ -n "$floor_type" ] && [ "${WORKER_TYPE_RANK[$floor_type]}" -gt "${WORKER_TYPE_RANK[$WORKER_TYPE]}" ]; then
+        log "SIZING: module '$src_type' requires worker type >= $floor_type; raising WORKER_TYPE $WORKER_TYPE -> $floor_type"
+        WORKER_TYPE="$floor_type"
+    fi
+}
+
+# --add only: sizing cannot be applied to a live cluster, so its capacity must
+# already meet the floor. Prints an error and returns 1 on a shortfall.
+check_live_capacity() {
+    local m="$1"
+    local need_w="${MOD_MIN_WORKERS[$m]:-}" need_t="${MOD_MIN_WORKER_TYPE[$m]:-}"
+    [ -n "$need_w$need_t" ] || return 0
+    local worker_count
+    worker_count="$(oc get nodes -l node-role.kubernetes.io/worker -o name 2>/dev/null | wc -l | tr -d ' ')"
+    if [ -n "$need_w" ] && [ "${worker_count:-0}" -lt "$need_w" ]; then
+        echo "module '$m' needs >= $need_w worker node(s) but the cluster has ${worker_count:-0}"
+        return 1
+    fi
+    if [ -n "$need_t" ]; then
+        local need_r="${WORKER_TYPE_RANK[$need_t]:-}"
+        [ -n "$need_r" ] || { echo "module '$m' requires worker type '$need_t' not in WORKER_TYPE_RANK"; return 1; }
+        local types best=0 t
+        types="$(oc get nodes -l node-role.kubernetes.io/worker \
+            -o jsonpath='{.items[*].metadata.labels.node\.kubernetes\.io/instance-type}' 2>/dev/null || true)"
+        for t in $types; do
+            local r="${WORKER_TYPE_RANK[$t]:-0}"
+            [ "$r" -gt "$best" ] && best="$r"
+        done
+        if [ "$best" -lt "$need_r" ]; then
+            echo "module '$m' needs worker type >= $need_t but the cluster's largest worker is below that"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Build-mode module preflight (mode=build) collects ALL errors and aborts before any
+# resource is created — the "fail in seconds" guarantee. Add-mode (mode=add) also
+# checks live capacity against each module's floor. Hooks MUST NOT create anything.
+run_module_preflight() {
+    local mode="$1"; shift
+    local modules=("$@") m errors=()
+    for m in "${modules[@]}"; do
+        log "[preflight] module '$m'..."
+        if [ "$mode" = "add" ]; then
+            local cap_err
+            cap_err="$(check_live_capacity "$m")" || errors+=("$cap_err")
+        fi
+        if declare -F "${m}_preflight" >/dev/null; then
+            local out
+            if ! out="$("${m}_preflight" 2>&1)"; then
+                errors+=("module '$m' preflight failed:${out:+ $out}")
+            fi
+        fi
+    done
+    if [ "${#errors[@]}" -gt 0 ]; then
+        echo "Module preflight failed with ${#errors[@]} error(s):" >&2
+        local e; for e in "${errors[@]}"; do echo "  - $e" >&2; done
+        exit 1
+    fi
+    log "Module preflight passed (${#modules[@]} module(s))."
+}
+
+# A module is blocked if it failed earlier or any module it REQUIRES failed — never
+# install a dependent onto a broken dependency.
+_module_blocked() {
+    local m="$1" req
+    [ -n "${MOD_FAILED[$m]:-}" ] && return 0
+    for req in ${MOD_REQUIRES[$m]:-}; do
+        [ -n "${MOD_FAILED[$req]:-}" ] && return 0
+    done
+    return 1
+}
+
+# Phase-major dispatcher for provision/install/wait/verify (continue-on-failure).
+# A missing hook is skipped. A failing hook is recorded and its module's later phases
+# are skipped; the run continues and the failure is reported in the end-of-run summary.
+# Calling the hook inside `if` suspends set -e / the ERR trap (as wait_co_settled does).
+run_module_phase() {
+    local hook="$1"; shift
+    local modules=("$@") m
+    for m in "${modules[@]}"; do
+        if _module_blocked "$m"; then
+            warn "module '$m' skipped for '$hook' (it or a dependency failed earlier)"
+            continue
+        fi
+        declare -F "${m}_${hook}" >/dev/null || continue
+        log "[$hook] module '$m'..."
+        if "${m}_${hook}"; then
+            :
+        else
+            MOD_FAILED[$m]=1
+            MODULE_FAILURES+=("$m ($hook)")
+            warn "module '$m' failed during '$hook'"
+        fi
+    done
+}
+
+# Per-cluster state: which modules are installed, one name per line, in the install
+# dir so --remove and teardown know what to clean up.
+_state_file() { echo "${INSTALL_DIR}/modules.state"; }
+state_add_module() {
+    local f; f="$(_state_file)"
+    touch "$f"; chmod 600 "$f"
+    grep -qxF "$1" "$f" 2>/dev/null || echo "$1" >> "$f"
+}
+state_remove_module() {
+    local f; f="$(_state_file)"
+    [ -f "$f" ] || return 0
+    grep -vxF "$1" "$f" > "$f.tmp" 2>/dev/null || true
+    mv "$f.tmp" "$f"
+}
+state_list_modules() {
+    local f; f="$(_state_file)"
+    [ -f "$f" ] && cat "$f" || true
+}
+
+# Print the correct teardown sequence. If modules are installed they must be removed
+# FIRST (their destroy hooks clean up cluster-external AWS resources that
+# `openshift-install destroy` will not touch), THEN the cluster is destroyed.
+print_teardown_hint() {
+    local installed; installed="$(state_list_modules | tr '\n' ' ')"; installed="${installed% }"
+    if [ -n "$installed" ]; then
+        echo "  # This cluster has modules installed: $installed"
+        echo "  # Remove them first (runs destroy hooks, incl. AWS cleanup):"
+        echo "  $0 --remove ${installed// /,} --dir $INSTALL_DIR"
+        local m
+        for m in $installed; do
+            load_module "$m" 2>/dev/null || true
+            declare -F "${m}_destroy" >/dev/null 2>&1 || \
+                echo "  #   note: module '$m' has no destroy hook (may orphan resources)"
+        done
+        echo "  # Then destroy the cluster:"
+    fi
+    echo "  $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"
+}
+
+# Report module failures at the very end (continue-on-failure). Returns 1 if any.
+report_module_failures() {
+    [ "${#MODULE_FAILURES[@]}" -eq 0 ] && return 0
+    echo "" >&2
+    echo "MODULE FAILURES (${#MODULE_FAILURES[@]}):" >&2
+    local f; for f in "${MODULE_FAILURES[@]}"; do echo "  - $f" >&2; done
+    return 1
+}
+
+# Print available modules with descriptions and resource floors (--list-modules).
+list_modules() {
+    local name floor any=0
+    for name in $(discover_modules | sort); do
+        any=1
+        load_module "$name"
+        floor=""
+        [ -n "${MOD_MIN_WORKERS[$name]}" ]     && floor+="workers>=${MOD_MIN_WORKERS[$name]} "
+        [ -n "${MOD_MIN_WORKER_TYPE[$name]}" ] && floor+="type>=${MOD_MIN_WORKER_TYPE[$name]} "
+        [ -n "${MOD_REQUIRES[$name]}" ]        && floor+="requires:${MOD_REQUIRES[$name]// /,} "
+        [ "${MOD_CREATES_AWS[$name]}" = "true" ] && floor+="(creates AWS resources) "
+        printf '  %-16s %s\n' "$name" "${MOD_DESCRIPTION[$name]}"
+        [ -n "$floor" ] && printf '  %-16s   floor: %s\n' "" "${floor% }"
+    done
+    [ "$any" = 1 ] || echo "  (no modules found in $MODULES_DIR)"
+}
+
+# --add / --remove target an EXISTING cluster: require --dir and its kubeconfig.
+require_target_dir() {
+    [ -n "$TARGET_DIR" ] || die "--add/--remove require --dir <install-dir>"
+    [ -d "$TARGET_DIR" ] || die "--dir not found: $TARGET_DIR"
+    local kc="$TARGET_DIR/auth/kubeconfig"
+    [ -f "$kc" ] || die "kubeconfig not found in --dir: $kc"
+    INSTALL_DIR="$TARGET_DIR"
+    export KUBECONFIG="$kc"
+    log "Targeting existing cluster in $INSTALL_DIR (KUBECONFIG set)."
+}
+
+# --add: preflight (with live-capacity check) then install/wait/verify. No cluster
+# build, no certs, no gitops. Sizing cannot be applied — preflight hard-fails on a
+# too-small cluster rather than leaving pods Pending.
+run_add_mode() {
+    require_target_dir
+    run_module_preflight add "${RESOLVED_ORDER[@]}"
+    run_module_phase install "${RESOLVED_ORDER[@]}"
+    run_module_phase wait    "${RESOLVED_ORDER[@]}"
+    run_module_phase verify  "${RESOLVED_ORDER[@]}"
+    local m
+    for m in "${RESOLVED_ORDER[@]}"; do
+        [ -n "${MOD_FAILED[$m]:-}" ] || state_add_module "$m"
+    done
+    report_module_failures || die "one or more modules failed (see summary above)"
+    log "Add complete."
+}
+
+# --remove: run destroy hooks in REVERSE dependency order (dependents before
+# dependencies). A module with no destroy hook is logged so orphaned resources are visible.
+run_remove_mode() {
+    require_target_dir
+    local i m
+    for (( i=${#RESOLVED_ORDER[@]}-1; i>=0; i-- )); do
+        m="${RESOLVED_ORDER[$i]}"
+        if declare -F "${m}_destroy" >/dev/null; then
+            run_module_phase destroy "$m"
+        else
+            warn "module '$m' has no destroy hook; nothing removed for it (possible orphaned resources)"
+        fi
+        [ -n "${MOD_FAILED[$m]:-}" ] || state_remove_module "$m"
+    done
+    report_module_failures || die "one or more modules failed to destroy (see summary above)"
+    log "Remove complete."
+}
+
 # --- ERR trap: never leave a half-built cluster running silently --------------
 # On any failure after provisioning has begun, print the exact destroy command.
 on_err() {
@@ -301,7 +667,7 @@ on_err() {
     echo "ERROR: deployment failed (exit $rc)." >&2
     if [ -n "${INSTALL_DIR:-}" ] && [ -f "${INSTALL_DIR}/metadata.json" ]; then
         echo "A cluster exists in AWS (dir=${INSTALL_DIR}). If you want to tear it down:" >&2
-        echo "  ${OPENSHIFT_INSTALL} destroy cluster --dir=${INSTALL_DIR}" >&2
+        print_teardown_hint >&2
     fi
     exit "$rc"
 }
@@ -383,7 +749,53 @@ preflight() {
     echo "Preflight checks passed."
 }
 
+# --- Module resolution & mode dispatch ---------------------------------------
+# Merge the configured MODULES set with repeated/comma-separated --with additions.
+ENABLED_MODULES=()
+_add_enabled() {  # split $1 on commas and whitespace into ENABLED_MODULES
+    local item; local IFS=', '
+    for item in $1; do [ -n "$item" ] && ENABLED_MODULES+=("$item"); done
+}
+[ -n "${MODULES// }" ] && _add_enabled "$MODULES"
+[ -n "$WITH_MODULES" ] && _add_enabled "$WITH_MODULES"
+
+# --list-modules prints and exits before any preflight or cluster work.
+if [ -n "$LIST_MODULES" ]; then
+    echo "Available modules (from $MODULES_DIR):"
+    list_modules
+    exit 0
+fi
+
+# In --add / --remove the target set comes from that flag, not --with / MODULES.
+case "$MODE" in
+    add)    ENABLED_MODULES=(); _add_enabled "$ADD_MODULES" ;;
+    remove) ENABLED_MODULES=(); _add_enabled "$REMOVE_MODULES" ;;
+esac
+
+# Resolve dependencies (transitive, cycle-checked) into RESOLVED_ORDER.
+if [ "${#ENABLED_MODULES[@]}" -gt 0 ]; then
+    resolve_dependencies "${ENABLED_MODULES[@]}"
+fi
+
+# --add / --remove operate on an existing cluster: no build, no build preflight.
+case "$MODE" in
+    add)    run_add_mode;    exit 0 ;;
+    remove) run_remove_mode; exit 0 ;;
+esac
+
+# Build mode: sizing must be resolved BEFORE install-config.yaml is rendered, so a
+# module's worker-pool floor flows into the render below.
+if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
+    resolve_sizing "${RESOLVED_ORDER[@]}"
+fi
+
 preflight
+
+# Module preflight for the build: every enabled module is validated before ANY
+# resource is created, so an impossible combination fails in seconds.
+if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
+    run_module_preflight build "${RESOLVED_ORDER[@]}"
+fi
 
 # --- Prepare installation directory ------------------------------------------
 # Every per-run dir lives under the fixed WORKDIR_ROOT parent so .gitignore can
@@ -464,6 +876,13 @@ trap on_err ERR
 sed "s#^pullSecret:.*#pullSecret: '<redacted>'#" "$RENDERED" > "$RENDERED.bak"
 chmod 600 "$RENDERED.bak"
 echo "Backed up rendered install-config to $RENDERED.bak (installer consumes the original)."
+
+# --- Module provision (cluster-external resources, before the cluster) --------
+# Runs before `create cluster` so a module can stand up S3/IAM the installer needs.
+# No module uses this yet; the plumbing is built and dispatched.
+if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
+    run_module_phase provision "${RESOLVED_ORDER[@]}"
+fi
 
 # --- Start OpenShift cluster installation ------------------------------------
 echo "Starting OpenShift cluster installation in directory: $INSTALL_DIR"
@@ -624,8 +1043,30 @@ else
     echo "Skipping OpenShift GitOps deployment (--skip-gitops)."
 fi
 
+# --- Module install / wait / verify ------------------------------------------
+# The cluster is up; apply each enabled module, wait for it, then verify it works.
+# Continue-on-failure: a failing module is recorded and reported in the summary
+# below rather than aborting the run (the expensive cluster already exists).
+if [ "${#RESOLVED_ORDER[@]}" -gt 0 ]; then
+    echo "--- Installing modules: ${RESOLVED_ORDER[*]} ---"
+    run_module_phase install "${RESOLVED_ORDER[@]}"
+    run_module_phase wait    "${RESOLVED_ORDER[@]}"
+    run_module_phase verify  "${RESOLVED_ORDER[@]}"
+    for m in "${RESOLVED_ORDER[@]}"; do
+        [ -n "${MOD_FAILED[$m]:-}" ] || state_add_module "$m"
+    done
+fi
+
 # Success: disarm the ERR trap so the destroy hint is not printed on a clean exit.
 trap - ERR
 
 echo "OpenShift Lab Deployment Complete!"
-echo "Tear down the cluster with: $OPENSHIFT_INSTALL destroy cluster --dir=$INSTALL_DIR"
+echo "Tear down with:"
+print_teardown_hint
+
+# Report any module failures at the very end (continue-on-failure semantics), and
+# exit non-zero so callers/CI see that the run was not fully clean.
+if ! report_module_failures; then
+    echo "Cluster is up, but one or more modules failed (see above)." >&2
+    exit 1
+fi

@@ -74,13 +74,118 @@ the `: "${VAR:=value}"` form so it never clobbers a value already in the
 environment. Overridable vars: `CLUSTER_NAME`, `AWS_REGION`, replicas, instance
 types, `OWNER`, `PURPOSE`, `TTL_DAYS`, `OCP_VERSION`, `WORKDIR_ROOT`,
 `PULL_SECRET_FILE`, `INSTALL_CONFIG_TEMPLATE`, `CA_KEY_FILE`, `CA_CERT_FILE`,
-`ARGOCD_MANAGED_NAMESPACES`. Paths
+`ARGOCD_MANAGED_NAMESPACES`, `MODULES`. Paths
 default repo-relative — **no personal absolute paths**. `LAB_ENV` (env only) points
-at the config file; the smoke test uses it to inject a scratch `lab.env`.
+at the config file; the smoke test uses it to inject a scratch `lab.env`. `MODULES_DIR`
+(env only, defaults to `$SCRIPT_DIR/modules`) points at the module tree — the smoke
+test overrides it to inject scratch module fixtures, mirroring the `LAB_ENV` trick.
 
 **openshift-install locator:** `./$OCP_VERSION/openshift-install` →
 `./openshift-install` → `$PATH`. This replaces the old "copy the script into a
 version subdir" workflow.
+
+## Module system
+
+Optional products (RHACS, RHACM, OADP, OpenShift Logging) are **modules** enabled by
+a flag. A module is `modules/<name>/module.sh`, **sourced** by `ocp-install.sh`, so it
+shares the `log/warn/die` helpers and the idempotency convention. Modules only ever
+run against clusters this script built — **do not add foreign-cluster portability**.
+(`modules/hello` is a throwaway test module that exercises the framework; delete it
+when the first real module lands.)
+
+**Dispatch is PHASE-MAJOR, never module-major.** The main flow loops over phases and,
+within each phase, over the enabled modules — never one module end-to-end. Order:
+
+```
+resolve → preflight(all) → provision(all) → [cluster install] → install(all) → wait(all) → verify(all)
+```
+
+Every enabled module's **preflight must pass before anything is created**, so an
+impossible combination fails in seconds rather than after a ~45-minute build. **Sizing
+is resolved during `resolve`, before `install-config.yaml` is rendered**, because a
+module may need a bigger worker pool than the default (`resolve_sizing`).
+
+### Module contract
+
+A module sets metadata globals at source time; the loader snapshots them into
+per-module arrays and unsets the globals so the next module can't inherit stale values.
+Hooks are functions named `<name>_<hook>` — collision-proof because the name embeds the
+module. **Namespace every hook and internal variable with the module name.**
+
+| Metadata global | Meaning |
+|---|---|
+| `MODULE_DESCRIPTION` | human text for `--list-modules` (**required**) |
+| `MODULE_REQUIRES` | space-separated module names that must also be enabled |
+| `MODULE_MIN_WORKERS` | worker-count floor; empty = no requirement |
+| `MODULE_MIN_WORKER_TYPE` | worker instance-type floor; empty = no requirement |
+| `MODULE_CREATES_AWS` | `true`/`false`: creates cluster-external AWS resources |
+
+Hooks (all optional **except `install`**; a missing hook is skipped for that phase):
+
+- `preflight` — validate config/tools/creds. **MUST NOT create anything.**
+- `provision` — create cluster-external resources (S3/IAM), before the cluster exists.
+- `install` — apply manifests to the cluster (**required**).
+- `wait` — block until the module's workloads are actually ready.
+- `verify` — assert the module works (**meaningful**, not just "pods Running").
+- `destroy` — remove what install + provision created, including AWS resources.
+
+**Dependencies** are expanded transitively with cycle detection and a deterministic
+order (dependencies before dependents); the resolved set is logged when it differs from
+what was asked for. **Sizing** raises `WORKER_REPLICAS`/`WORKER_TYPE` to the max floor
+across the enabled set and logs loudly which module forced it — **never scales below
+what the user asked for**. Instance types are **not** lexically ordered, so comparison
+goes through the explicit `WORKER_TYPE_RANK` table; a type absent from the table is a
+hard error, never a guess.
+
+### Flags & modes
+
+- `--with <a,b,c>` — enable modules on a fresh build (repeatable **and** comma-separated).
+  `MODULES` (config var) does the same via `lab.env`/environment; `--with` appends.
+- `--list-modules` — print modules with descriptions + floors, exit.
+- `--add <a,b> --dir <path>` — install modules into an **existing** cluster. Skips
+  cluster/cert/gitops entirely; sets `KUBECONFIG` from `<dir>/auth/kubeconfig`. Sizing
+  **cannot** be applied to a live cluster, so add-mode preflight compares each floor
+  against the **live node capacity** and **hard-fails** naming the module and shortfall
+  rather than leaving pods Pending.
+- `--remove <a,b> --dir <path>` — run `destroy` hooks (reverse dependency order) against
+  an existing cluster. A module lacking a destroy hook is logged (possible orphans).
+- `--dir` is required by `--add`/`--remove`; a missing dir or kubeconfig fails clearly.
+
+Installed modules are recorded in `<install-dir>/modules.state` so `--remove` and
+teardown know what to clean up.
+
+### Failure semantics (chosen)
+
+- **preflight (build): all-or-nothing, before any creation.** Collect every enabled
+  module's preflight errors and abort if any — nothing is created. This is the
+  "fail in seconds" guarantee.
+- **provision/install/wait/verify: continue-on-failure, reported at the end.** These
+  run *after* a ~45-minute cluster build already succeeded; aborting because one module
+  failed would waste the working cluster and the other modules. A failed module is
+  recorded, its own later phases and any modules that `REQUIRE` it are **skipped** (never
+  install a dependent onto a broken dependency), and a **failure summary is printed at
+  the very end** with a non-zero exit — never buried mid-log.
+
+### Teardown
+
+`openshift-install destroy cluster` does **not** remove a module's S3/IAM. The ERR-trap
+and success-banner destroy hints are module-aware: if `modules.state` is non-empty they
+tell you to `--remove` the installed modules **first** (runs destroy hooks), **then**
+destroy the cluster, and name any installed module that has no destroy hook.
+
+### How to write a module
+
+1. Create `modules/<name>/module.sh`. Set `MODULE_DESCRIPTION` (required) and any floors
+   /`MODULE_REQUIRES`/`MODULE_CREATES_AWS` it needs.
+2. Implement `<name>_install` (required) and whichever of `preflight`/`provision`/`wait`
+   /`verify`/`destroy` apply. **Prefix every function and variable with `<name>_`.**
+3. Use the shared `log/warn/die` helpers and the idempotent
+   `oc create … --dry-run=client -o yaml | oc apply -f -` pattern; `wait_for_object`
+   is available for "wait until it exists".
+4. Give `verify` a real assertion (read something back), and `destroy` must undo both
+   `install` and `provision` (including AWS resources).
+5. Add smoke coverage in `test/smoke.sh` using scratch module fixtures via `MODULES_DIR`
+   and the stub `oc` — never touch a real cluster.
 
 ## HARD RULE — never touch a real cluster or AWS
 
@@ -108,6 +213,17 @@ still parses as JSON; every `platform.aws.userTags` value is a string (the
 `CLUSTER_NAME` drives `metadata.name`; config precedence (flag > env > lab.env >
 default); and preflight reports **all** errors in one run. Run with `KEEP=1` to keep
 the scratch dir for inspection.
+
+For the **module system** it additionally points `MODULES_DIR` at scratch module
+fixtures and uses a state-aware `oc` stub (records a ConfigMap's value on `create`,
+returns it on `get` — so a module `verify` genuinely round-trips) to assert: discovery
++ a malformed module rejected clearly; transitive dependency expansion + cycle
+detection; sizing (max floor wins, a larger user topology is not scaled down, an
+unknown instance type fails); `--list-modules`; `--add`/`--remove` require `--dir`;
+**phase ordering** (all preflights before any install, across modules); and `--dry-run`
+with modules still renders a valid install-config. When adding an `oc`-piped call to the
+stub path, remember the stub drains `-f -` stdin so `oc create … | oc apply -f -` can't
+SIGPIPE.
 
 ## Conventions
 

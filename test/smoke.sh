@@ -69,8 +69,46 @@ cat > "$STUB_BIN/openshift-install" <<'EOF'
 echo "STUB openshift-install: $*"
 exit 0
 EOF
-cat > "$STUB_BIN/oc" <<'EOF'
+# State-aware oc stub: a strict superset of the old echo-and-exit-0 behavior (so the
+# existing tests are unaffected), plus just enough ConfigMap state to let a module's
+# verify hook genuinely round-trip a value. `oc create configmap … --from-literal=
+# greeting=X …` records X (the value is right there in argv); `oc get configmap … -o
+# jsonpath={.data.greeting}` reads it back. Everything else echoes and succeeds.
+STUB_STATE="$SCRATCH/oc-state"
+mkdir -p "$STUB_STATE"
+cat > "$STUB_BIN/oc" <<EOF
 #!/usr/bin/env bash
+STUB_STATE="$STUB_STATE"
+EOF
+cat >> "$STUB_BIN/oc" <<'EOF'
+ns="default"
+prev=""
+for a in "$@"; do
+    [ "$prev" = "-n" ] && ns="$a"
+    prev="$a"
+done
+case "${1:-}" in
+  create)
+    if [ "${2:-}" = "configmap" ]; then
+        name="${3:-}"
+        for a in "$@"; do
+            case "$a" in --from-literal=greeting=*) greeting="${a#--from-literal=greeting=}";; esac
+        done
+        mkdir -p "$STUB_STATE"
+        printf '%s' "${greeting:-}" > "$STUB_STATE/cm.$ns.$name.greeting"
+    fi
+    ;;
+  get)
+    if [ "${2:-}" = "configmap" ] && printf '%s\n' "$@" | grep -q 'data.greeting'; then
+        f="$STUB_STATE/cm.$ns.${3:-}.greeting"
+        [ -f "$f" ] && cat "$f"
+        exit 0
+    fi
+    ;;
+esac
+# Drain piped stdin (`oc apply -f -`) so an upstream `oc create … |` writer never
+# takes a SIGPIPE (real `oc apply` reads the manifest; the stub must too).
+case " $* " in *" -f - "*) cat >/dev/null 2>&1 || true ;; esac
 echo "STUB oc: $*"
 exit 0
 EOF
@@ -386,6 +424,262 @@ if git -C "$REPO_DIR" check-ignore -q lab.env.example; then
 else
     pass "lab.env.example is trackable (not ignored)"
 fi
+
+# =============================================================================
+# Module system tests. Modules are discovered from MODULES_DIR (env-overridable),
+# so each test points it at a scratch fixture tree. mk_module writes a minimal valid
+# module; mk_ordering_module writes one that defines every hook so the phase-major
+# dispatcher emits a "[hook] module" marker we can assert order on.
+# =============================================================================
+MODS="$SCRATCH/mods"
+
+# mk_module <root> <name> <requires> <min_workers> <min_type>
+mk_module() {
+    local root="$1" name="$2" reqs="$3" minw="$4" mint="$5"
+    mkdir -p "$root/$name"
+    cat > "$root/$name/module.sh" <<EOF
+MODULE_DESCRIPTION="test module $name"
+MODULE_REQUIRES="$reqs"
+MODULE_MIN_WORKERS="$minw"
+MODULE_MIN_WORKER_TYPE="$mint"
+MODULE_CREATES_AWS="false"
+${name}_install() { echo "PHASE:install:$name"; }
+EOF
+}
+
+# mk_ordering_module <root> <name>: defines all five hooks so every phase is dispatched.
+mk_ordering_module() {
+    local root="$1" name="$2"
+    mkdir -p "$root/$name"
+    cat > "$root/$name/module.sh" <<EOF
+MODULE_DESCRIPTION="ordering probe $name"
+MODULE_REQUIRES=""
+MODULE_MIN_WORKERS=""
+MODULE_MIN_WORKER_TYPE=""
+MODULE_CREATES_AWS="false"
+${name}_preflight() { :; }
+${name}_provision() { :; }
+${name}_install()   { :; }
+${name}_wait()      { :; }
+${name}_verify()    { :; }
+EOF
+}
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 8: module discovery + malformed module rejected =="
+mk_module "$MODS/ok" good "" "" ""
+out8="$(run_ocp run8-list MODULES_DIR="$MODS/ok" -- --list-modules 2>&1)"
+if grep -q "good" <<<"$out8" && grep -q "test module good" <<<"$out8"; then
+    pass "discovery listed the scratch module with its description"
+else
+    echo "$out8"; fail "discovery did not list the scratch module"
+fi
+# Malformed: no MODULE_DESCRIPTION (write a module that only defines an install hook).
+mkdir -p "$MODS/bad/bad"
+cat > "$MODS/bad/bad/module.sh" <<'EOF'
+bad_install() { :; }
+EOF
+set +e
+out8b="$(run_ocp run8-bad MODULES_DIR="$MODS/bad" -- -d smoke.example.com --with bad --dry-run 2>&1)"
+rc8b=$?
+set -e
+if [ "$rc8b" -ne 0 ] && grep -q "malformed" <<<"$out8b" && grep -q "'bad'" <<<"$out8b"; then
+    pass "malformed module rejected with a clear, module-naming error"
+else
+    echo "$out8b"; fail "malformed module was not rejected clearly"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 9: dependency expansion (transitive) + cycle detection =="
+mk_module "$MODS/dep" a "b" "" ""
+mk_module "$MODS/dep" b "c" "" ""
+mk_module "$MODS/dep" c "" "" ""
+out9="$(run_ocp run9 MODULES_DIR="$MODS/dep" -- -d smoke.example.com --with a --dry-run 2>&1)"
+if grep -q "resolved with dependencies" <<<"$out9" \
+   && grep -Eq "resolved with dependencies \[a b c\]|resolved with dependencies \[.*a.*b.*c.*\]" <<<"$out9"; then
+    pass "transitive dependency expansion (a -> b -> c) resolved and logged"
+else
+    echo "$out9" | grep -i "module\|resolved" || true
+    fail "transitive dependency expansion not logged as expected"
+fi
+# Order: dependencies must come before dependents.
+if grep -q "Module install order: c b a" <<<"$out9"; then
+    pass "install order lists dependencies before dependents (c b a)"
+else
+    echo "$out9" | grep -i "install order" || true
+    fail "install order did not put dependencies first"
+fi
+# Cycle x -> y -> x must be detected.
+mk_module "$MODS/cyc" x "y" "" ""
+mk_module "$MODS/cyc" y "x" "" ""
+set +e
+out9c="$(run_ocp run9c MODULES_DIR="$MODS/cyc" -- -d smoke.example.com --with x --dry-run 2>&1)"
+rc9c=$?
+set -e
+if [ "$rc9c" -ne 0 ] && grep -qi "cycle" <<<"$out9c"; then
+    pass "dependency cycle detected and reported"
+else
+    echo "$out9c"; fail "dependency cycle not detected"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 10: sizing — max floor wins, no scale-down, unknown type fails =="
+mk_module "$MODS/size" big "" "3" "m6i.2xlarge"
+# (a) Floor raises the default (1 / m6i.xlarge) up to 3 / m6i.2xlarge.
+run_ocp run10a MODULES_DIR="$MODS/size" -- -d smoke.example.com --with big --dry-run >/dev/null 2>&1
+R10A="$(find "$SCRATCH/run10a" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
+if R="$R10A" python3 - <<'PY'
+import os, yaml, sys
+doc = yaml.safe_load(open(os.environ["R"]))
+w = doc["compute"][0]
+ok = (w["replicas"] == 3 and w["platform"]["aws"]["type"] == "m6i.2xlarge")
+print("  PASS: sizing raised topology to floor (3 / m6i.2xlarge)" if ok
+      else f"  FAIL: expected 3/m6i.2xlarge, got {w['replicas']}/{w['platform']['aws']['type']}")
+sys.exit(0 if ok else 1)
+PY
+then :; else FAILS=$((FAILS + 1)); fi
+# (b) A larger user-specified topology is NOT scaled down.
+run_ocp run10b MODULES_DIR="$MODS/size" -- -d smoke.example.com --with big \
+    --worker-replicas 5 --worker-type m6i.4xlarge --dry-run >/dev/null 2>&1
+R10B="$(find "$SCRATCH/run10b" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
+if R="$R10B" python3 - <<'PY'
+import os, yaml, sys
+w = yaml.safe_load(open(os.environ["R"]))["compute"][0]
+ok = (w["replicas"] == 5 and w["platform"]["aws"]["type"] == "m6i.4xlarge")
+print("  PASS: larger user topology preserved (5 / m6i.4xlarge, not scaled down)" if ok
+      else f"  FAIL: expected 5/m6i.4xlarge, got {w['replicas']}/{w['platform']['aws']['type']}")
+sys.exit(0 if ok else 1)
+PY
+then :; else FAILS=$((FAILS + 1)); fi
+# (c) An unknown instance-type floor fails clearly.
+mk_module "$MODS/size" badtype "" "" "z9.enormous"
+set +e
+out10c="$(run_ocp run10c MODULES_DIR="$MODS/size" -- -d smoke.example.com --with badtype --dry-run 2>&1)"
+rc10c=$?
+set -e
+if [ "$rc10c" -ne 0 ] && grep -q "WORKER_TYPE_RANK" <<<"$out10c" && grep -q "z9.enormous" <<<"$out10c"; then
+    pass "unknown instance type failed clearly (not in ranking table)"
+else
+    echo "$out10c"; fail "unknown instance type did not fail clearly"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 11: --list-modules prints descriptions and floors =="
+mk_module "$MODS/list" sized "" "4" "m6i.4xlarge"
+out11="$(run_ocp run11 MODULES_DIR="$MODS/list" -- --list-modules 2>&1)"
+if grep -q "sized" <<<"$out11" && grep -q "workers>=4" <<<"$out11" && grep -q "type>=m6i.4xlarge" <<<"$out11"; then
+    pass "--list-modules printed the module description and resource floor"
+else
+    echo "$out11"; fail "--list-modules did not print description + floor"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 12: --add/--remove require --dir; nonexistent dir fails =="
+set +e
+o12a="$(run_ocp run12a MODULES_DIR="$REPO_DIR/modules" -- --add hello 2>&1)";     rc12a=$?
+o12b="$(run_ocp run12b MODULES_DIR="$REPO_DIR/modules" -- --remove hello 2>&1)";  rc12b=$?
+o12c="$(run_ocp run12c MODULES_DIR="$REPO_DIR/modules" -- --add hello --dir "$SCRATCH/does-not-exist" 2>&1)"; rc12c=$?
+set -e
+if [ "$rc12a" -ne 0 ] && grep -q -- "--dir" <<<"$o12a"; then pass "--add without --dir failed"; else echo "$o12a"; fail "--add without --dir did not fail"; fi
+if [ "$rc12b" -ne 0 ] && grep -q -- "--dir" <<<"$o12b"; then pass "--remove without --dir failed"; else echo "$o12b"; fail "--remove without --dir did not fail"; fi
+if [ "$rc12c" -ne 0 ] && grep -qi "not found" <<<"$o12c"; then pass "--add with nonexistent --dir failed"; else echo "$o12c"; fail "--add with nonexistent --dir did not fail"; fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 13: phase ordering — all preflights before any install, etc. =="
+mk_ordering_module "$MODS/order" om1
+mk_ordering_module "$MODS/order" om2
+# Full stubbed path (no --dry-run) so install/wait/verify actually dispatch; skip
+# certs + gitops so it never approaches AWS. Stubs make every oc/openshift-install
+# call succeed.
+set +e
+out13="$(run_ocp run13 MODULES_DIR="$MODS/order" -- \
+    -d smoke.example.com --with om1,om2 --skip-certs --skip-gitops 2>&1)"
+set -e
+echo "$out13" > "$SCRATCH/order.log"
+if PHASE_LOG="$SCRATCH/order.log" python3 - <<'PY'
+import os, re, sys
+order = ["preflight", "provision", "install", "wait", "verify"]
+rank = {p: i for i, p in enumerate(order)}
+seq = []
+for line in open(os.environ["PHASE_LOG"]):
+    m = re.match(r"\[(preflight|provision|install|wait|verify)\] module '(\w+)'", line)
+    if m:
+        seq.append((m.group(1), m.group(2)))
+fails = 0
+def bad(msg):
+    global fails; fails += 1; print(f"  FAIL: {msg}")
+# Every module must be seen in every phase.
+mods = {mod for _, mod in seq}
+if mods != {"om1", "om2"}:
+    bad(f"expected modules om1,om2 in the phase log, saw {sorted(mods)}")
+# The phase index must be non-decreasing across the whole run (phase-major dispatch).
+last = -1
+for phase, mod in seq:
+    if rank[phase] < last:
+        bad(f"phase '{phase}' ({mod}) ran after a later phase started (out of order)")
+    last = max(last, rank[phase])
+# Hard guarantee: the last preflight precedes the first install.
+pre = [i for i, (p, _) in enumerate(seq) if p == "preflight"]
+ins = [i for i, (p, _) in enumerate(seq) if p == "install"]
+if pre and ins and max(pre) < min(ins):
+    print("  PASS: all module preflights ran before any module install")
+else:
+    bad("preflight/install ordering guarantee violated")
+if not fails:
+    print("  PASS: phases dispatched in documented order across both modules")
+sys.exit(1 if fails else 0)
+PY
+then :; else FAILS=$((FAILS + 1)); fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 13b: hello module install -> verify round-trips through the cluster =="
+# Full stubbed path with the real repo `hello` module. The state-aware oc stub records
+# the ConfigMap greeting on create and returns it on get, so hello_verify (which reads
+# the value back and compares) is a genuine round-trip, not a no-op.
+set +e
+out13b="$(run_ocp run13b MODULES_DIR="$REPO_DIR/modules" -- \
+    -d smoke.example.com --with hello --skip-certs --skip-gitops 2>&1)"
+rc13b=$?
+set -e
+if [ "$rc13b" -eq 0 ] && grep -q "greeting round-tripped correctly" <<<"$out13b"; then
+    pass "hello install/verify round-tripped the ConfigMap value (clean exit)"
+else
+    echo "$out13b" | grep -i "hello\|verify\|module\|fail" || true
+    fail "hello install/verify round-trip did not succeed"
+fi
+# The install dir records the module so teardown/--remove know to clean it up.
+STATE13B="$(find "$SCRATCH/run13b" -maxdepth 3 -name modules.state -type f | head -n1)"
+if [ -n "$STATE13B" ] && grep -qx "hello" "$STATE13B"; then
+    pass "modules.state records the installed module"
+else
+    fail "modules.state did not record the installed module"
+fi
+
+# -----------------------------------------------------------------------------
+echo
+echo "== Test 14: --dry-run with modules enabled still renders valid install-config =="
+run_ocp run14 MODULES_DIR="$REPO_DIR/modules" -- -d smoke.example.com --with hello --dry-run >/dev/null 2>&1
+R14="$(find "$SCRATCH/run14" -maxdepth 3 -name install-config.yaml -type f | head -n1)"
+if [ -n "$R14" ] && R="$R14" python3 - <<'PY'
+import os, yaml, json, sys
+doc = yaml.safe_load(open(os.environ["R"]))
+ok = isinstance(doc, dict) and doc.get("metadata", {}).get("name") == "rbobek"
+try:
+    json.loads(doc.get("pullSecret", ""))
+except Exception:
+    ok = False
+print("  PASS: install-config renders and stays valid with a module enabled" if ok
+      else "  FAIL: install-config invalid with a module enabled")
+sys.exit(0 if ok else 1)
+PY
+then :; else FAILS=$((FAILS + 1)); fi
 
 # =============================================================================
 echo
