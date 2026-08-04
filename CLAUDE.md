@@ -50,6 +50,12 @@ The AWS environment must be prepared beforehand (see the README).
    monitoring Role for `prometheusrules`/`probes` — **never cluster-admin** (see
    README "Resolved"). Apply `invaders-application.yaml` **only if present** (warn
    otherwise); print the Argo CD route.
+10. **Access summary** (`print_access_summary`, on success) — the final block prints how
+    to reach the cluster: the `oc login -u kubeadmin -p … https://api…:6443` command, the
+    web console URL + kubeadmin credentials, and the Argo CD UI URL. The kubeadmin password
+    is read from `<install-dir>/auth/kubeadmin-password` and intentionally printed (lab
+    convenience); the read is wrapped in the `secret_xtrace_off/restore` guard so `bash -x`
+    doesn't echo it into the trace.
 
 Day-2 cluster mutations are **idempotent and rerunnable**: every `oc create`
 (namespace/secret/configmap) uses `oc create … --dry-run=client -o yaml | oc apply

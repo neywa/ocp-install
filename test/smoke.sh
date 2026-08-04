@@ -672,6 +672,15 @@ if [ -n "$STATE13B" ] && grep -qE "^hello installed$" "$STATE13B"; then
 else
     fail "modules.state did not record the installed module as installed"
 fi
+# The final banner prints cluster access details (CLI login + web console).
+if grep -q "oc login -u kubeadmin" <<<"$out13b" \
+   && grep -q "console-openshift-console.apps.rbobek.smoke.example.com" <<<"$out13b" \
+   && grep -q "Web console:" <<<"$out13b"; then
+    pass "access summary printed the oc login command and console URL"
+else
+    echo "$out13b" | grep -i "login\|console\|access" || true
+    fail "access summary did not print login/console details"
+fi
 
 # -----------------------------------------------------------------------------
 echo

@@ -707,6 +707,44 @@ print_teardown_hint() {
     fi
 }
 
+# Print how to reach the freshly built cluster: CLI login, web console, and the Argo CD
+# UI. kubeadmin's password comes from the installer's auth dir. This intentionally prints
+# the credential (a lab convenience — `openshift-install` does the same); the xtrace guard
+# only stops `bash -x` from echoing it a second time into the trace. Hosts are the derived
+# API/console names the custom certs are issued for; ARGOCD_HOST is set by the gitops phase.
+print_access_summary() {
+    local api_url="https://${API_HOST}:6443"
+    local console_url="https://${CONSOLE_HOST}"
+    local pw_file="${INSTALL_DIR}/auth/kubeadmin-password"
+    local pw=""
+    secret_xtrace_off
+    [ -f "$pw_file" ] && pw="$(cat "$pw_file")"
+    echo ""
+    echo "=== Cluster access ============================================================="
+    echo "CLI login:"
+    if [ -n "$pw" ]; then
+        echo "  oc login -u kubeadmin -p '${pw}' ${api_url}"
+    else
+        echo "  oc login -u kubeadmin ${api_url}   (kubeadmin password file not found: $pw_file)"
+    fi
+    echo ""
+    echo "Web console:"
+    echo "  URL:      ${console_url}"
+    echo "  Username: kubeadmin"
+    echo "  Password: ${pw:-<not found; see $pw_file>}"
+    echo ""
+    echo "Argo CD (GitOps) UI:"
+    if [ -n "${ARGOCD_HOST:-}" ]; then
+        echo "  URL:      https://${ARGOCD_HOST}   (log in with your OpenShift account, e.g. kubeadmin)"
+    elif [ -n "$SKIP_GITOPS" ]; then
+        echo "  (skipped: --skip-gitops)"
+    else
+        echo "  (route openshift-gitops-server not found; try 'oc get route -n openshift-gitops')"
+    fi
+    echo "==============================================================================="
+    secret_xtrace_restore
+}
+
 # Report module failures at the very end (continue-on-failure). Returns 1 if any.
 report_module_failures() {
     [ "${#MODULE_FAILURES[@]}" -eq 0 ] && return 0
@@ -1252,6 +1290,10 @@ trap - ERR
 echo "OpenShift Lab Deployment Complete!"
 echo "Tear down with:"
 print_teardown_hint
+
+# Print login details / URLs last so they land at the bottom of the terminal. Before the
+# failure check so they show even when a module failed (the cluster itself is still up).
+print_access_summary
 
 # Report any module failures at the very end (continue-on-failure semantics), and
 # exit non-zero so callers/CI see that the run was not fully clean.
